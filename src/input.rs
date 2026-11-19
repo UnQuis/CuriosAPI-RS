@@ -27,7 +27,10 @@ pub const OPEN_REQUEST_ID: &str = "curios:open_request";
 pub const OPEN_REQUEST_VERSION: &str = "1";
 
 /// Channel carrying a render-toggle request for one visible menu slot.
-pub const RENDER_REQUEST_ID: &str = "curios:toggle_render";
+/// Client-to-server render toggle. Must differ from the typed network channel
+/// `curios:toggle_render` registered in `net::register` — Horizon refuses two
+/// payload declarations with the same id in the same protocol.
+pub const RENDER_REQUEST_ID: &str = "curios:render_toggle_request";
 pub const RENDER_REQUEST_VERSION: &str = "1";
 
 /// Serverbound channel carrying the screen snapshot: page, cosmetic view and
@@ -543,6 +546,40 @@ mod tests {
         let declaration = menu_payload_declaration();
         assert_eq!(declaration.id, menu_payload_id());
         assert_eq!(declaration.direction, PayloadDirection::ToServer);
+    }
+
+    #[test]
+    fn payload_ids_do_not_collide_with_the_typed_network_channels() {
+        use crate::net::channel;
+        let typed = [
+            channel::DESTROY,
+            channel::OPEN_CURIOS,
+            channel::OPEN_VANILLA,
+            channel::CLIENT_PAGE,
+            channel::TOGGLE_COSMETICS,
+            channel::TOGGLE_RENDER,
+            channel::SYNC_STACK,
+            channel::GRABBED_ITEM,
+            channel::SYNC_CURIOS,
+            channel::SYNC_DATA,
+            channel::SYNC_MODIFIERS,
+            channel::SYNC_RENDER,
+            channel::SYNC_ACTIVE,
+            channel::BREAK,
+            channel::SERVER_PAGE,
+            channel::QUICK_MOVE,
+        ];
+        for own in [
+            OPEN_REQUEST_ID,
+            RENDER_REQUEST_ID,
+            SCREEN_STATE_ID,
+            MENU_REQUEST_ID,
+        ] {
+            assert!(
+                !typed.contains(&own),
+                "payload id {own} is already registered by net::register"
+            );
+        }
     }
 
     #[test]
