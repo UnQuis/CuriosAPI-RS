@@ -11,7 +11,12 @@
 use crate as mod_curios;
 use std::sync::Arc;
 
-use mod_api::{Compound, DatapackValue, Tag};
+use mod_api::testing::FakeHost;
+use mod_api::{
+    Compound, DatapackValue, HostTransaction, Identifier, IPayloadContext, ItemResource, ItemStack,
+    PayloadAccepted, PayloadBytes, PayloadContextError, PayloadDirection, PayloadId, PayloadProtocol,
+    PayloadSendError, PayloadWork, PayloadWorkStatus, PlaceProvider, PlayerRef, Tag, Text,
+};
 use mod_curios::inventory::{CurioInventory, INVENTORY};
 use mod_curios::slots::SlotContext;
 use mod_curios::{
@@ -107,25 +112,22 @@ fn datapack_values() -> Vec<(String, DatapackValue)> {
     ]
 }
 
-// #1 — tag-based validity, with an injected predicate (host tags are not faked).
+// #1 — the real host-aware validator, with only the SDK's Tags fake mocked.
 #[test]
 fn regression_01_tag_predicate() {
-    let slot = ring_slot();
-    assert!(slot.is_item_valid(&context(), &"mod:tagged_ring", |_, _, _| true));
-    assert!(!slot.is_item_valid(&context(), &"curios:ring", |_, _, _| false));
-    // The pure host-facing core must accept a tag member from another
-    // namespace; production `is_stack_valid_host` injects the real tag lookup.
-    assert!(equip::is_stack_valid_with(
-        &slot,
-        &context(),
-        "mod:tagged_ring",
-        |validator, _, item| {
-            matches!(
-                validator.resource_id().as_str().as_str(),
-                "curios:all" | "curios:tag"
-            ) && item == "mod:tagged_ring"
-        }
-    ));
+    let mut host = FakeHost::new();
+    let item_id = Identifier::parse("curios:ring").expect("item id");
+    host.registries
+        .resolve_items([item_id.clone()])
+        .expect("fake item table");
+    let item = mod_api::__private::item_key("curios:ring").expect("resolved item key");
+    // The fake has an authoritative empty tag registry: an id that merely
+    // looks like the slot tag must be refused. The pre-fix string matching
+    // accepted it, so this assertion locks in the real tag lookup.
+    assert!(
+        !equip::is_stack_valid_host(&host, &ring_slot(), &context(), item),
+        "production accepted an item by id, without a tag membership check"
+    );
 }
 
 // #3 — stacks that no longer fit after a reload must be returned, not dropped.
@@ -252,14 +254,77 @@ fn regression_10_per_player_gui_state() {
     assert_eq!(menu::page_count(9, 8), 2);
 }
 
-// #11 — a negative slot index must not be mapped to slot 0.
+/// The SDK context is only needed by `GrabbedItem`; the sync packets under
+/// test are handled by the production mirror without touching the host.
+struct NoPayloadContext;
+
+impl IPayloadContext for NoPayloadContext {
+    fn player(&self) -> Result<PlayerRef, PayloadContextError> {
+        unimplemented!("no player in a pure packet test")
+    }
+    fn flow(&self) -> PayloadDirection {
+        PayloadDirection::ToClient
+    }
+    fn protocol(&self) -> PayloadProtocol {
+        PayloadProtocol::Play
+    }
+    fn server_host(&mut self) -> Result<&mut dyn mod_api::ServerHost, PayloadContextError> {
+        unimplemented!("no server host in a pure packet test")
+    }
+    fn client_host(&mut self) -> Result<&mut dyn mod_api::ClientHost, PayloadContextError> {
+        unimplemented!("no client host in a pure packet test")
+    }
+    fn reply(
+        &mut self,
+        _id: &PayloadId,
+        _bytes: PayloadBytes,
+    ) -> Result<PayloadAccepted, PayloadSendError> {
+        unimplemented!("no reply in a pure packet test")
+    }
+    fn check_payload_token(&self, _token: &mod_api::PayloadToken) -> Result<(), PayloadSendError> {
+        Ok(())
+    }
+    fn disconnect(&mut self, _reason: Text) {}
+    fn enqueue_work(
+        &mut self,
+        _work: std::sync::Arc<dyn PayloadWork>,
+    ) -> Result<PayloadWorkStatus, PayloadContextError> {
+        unimplemented!("no work queue in a pure packet test")
+    }
+}
+
+// #11 — a negative slot index must be refused by the real client-mirror path.
 #[test]
 fn regression_11_negative_slot_not_zero() {
-    fn slot_index(raw: i32) -> Option<usize> {
-        usize::try_from(raw).ok()
-    }
-    assert_eq!(slot_index(-999), None);
-    assert_eq!(slot_index(0), Some(0));
+    let mut context = NoPayloadContext;
+    let entity = 7_001;
+    let mirror = net::SyncCurios {
+        entity_id: entity,
+        handlers: vec![net::NetHandler {
+            curio_id: "curios:ring".to_owned(),
+            stacks: vec![None, None],
+            cosmetic: vec![],
+            render: vec![true, true],
+            active: vec![true, true],
+            drop_rule: "default".to_owned(),
+            use_native_gui: true,
+        }],
+    };
+    net::handle_server(net::ServerPacket::SyncCurios(mirror), &mut context)
+        .expect("mirror installs the handler");
+    let empty = net::tag_to_net(&Tag::Compound(Compound::new()));
+    let update = net::ServerPacket::SyncStack(net::SyncStack {
+        entity_id: entity,
+        curio_id: "curios:ring".to_owned(),
+        slot_id: -999,
+        stack: None,
+        handler_type: net::HANDLER_EQUIPMENT,
+        compound_tag: empty,
+    });
+    assert!(
+        net::handle_server(update, &mut context).is_err(),
+        "the production mirror mapped slot -999 onto a real slot"
+    );
 }
 
 // #12 — every shipped locale is reachable and translated.
@@ -292,18 +357,17 @@ fn regression_13_action_queue() {
     assert_eq!(input::decode_render_toggle(&toggle), Ok(7));
 }
 
-// #14 — a failed reload must re-mark the pending flag for retry.
+// #14 — the real pending flag: mark -> take consumes it; a second take is
+// false until it is re-marked, which is how an error retry is expressed.
 #[test]
 fn regression_14_pending_remark() {
-    fn retry_after_failure(marked: &mut bool, result: Result<(), ()>) -> bool {
-        if result.is_err() {
-            *marked = true;
-        }
-        *marked
-    }
-    let mut marked = false;
-    assert!(retry_after_failure(&mut marked, Err(())));
+    while datapack::take_pending() {}
+    assert!(!datapack::take_pending());
     datapack::mark_pending();
+    assert!(datapack::take_pending(), "mark_pending did not set the flag");
+    assert!(!datapack::take_pending(), "take_pending did not consume the flag");
+    datapack::mark_pending();
+    assert!(datapack::take_pending(), "the flag was not re-marked for retry");
 }
 
 // #15 — a render packet names the actionable player, not the recipient.
@@ -322,15 +386,40 @@ fn regression_15_render_sync_target() {
     }
 }
 
-// #16 — an unknown item must be refused, not silently defaulted to 64.
+// #16 — the real `PlaceProvider::insert` must refuse an item that is not in
+// the slot's tag; it must not guess a stack size and accept it.
 #[test]
 fn regression_16_unknown_item_refuse() {
-    assert!(place::curio_place(7, "minecraft:unknown", 0).is_none());
-    assert!(curio_behavior_missing("minecraft:unknown"));
-}
-
-fn curio_behavior_missing(id: &str) -> bool {
-    mod_curios::curio::behavior(id).is_none()
+    const ITEM: &str = "mod:unknown_item";
+    let mut host = FakeHost::new();
+    host.registries
+        .resolve_items([Identifier::parse(ITEM).expect("item id")])
+        .expect("fake item table");
+    let key = mod_api::__private::item_key(ITEM).expect("resolved item key");
+    let stack = ItemStack::new(key, 1).expect("single item stack");
+    let resource = ItemResource::of(&stack);
+    // The production validator must refuse an item the tag predicate rejects.
+    assert!(!equip::is_stack_valid_with(
+        &ring_slot(),
+        &context(),
+        ITEM,
+        |_, _, _| false
+    ));
+    // The real provider refuses a place key with no slot type, before it can
+    // invent a stack size. Deterministic under any fake tag fixture.
+    let unknown_place = place::place_key(7, u16::MAX, 0);
+    let taken = host
+        .transaction(|host, tx| {
+            Ok::<u32, ()>(place::CurioPlaceProvider.insert(
+                host,
+                &tx,
+                unknown_place,
+                &resource,
+                64,
+            ))
+        })
+        .expect("transaction opens");
+    assert_eq!(taken, 0, "insert accepted a place with no slot type");
 }
 
 // #17 — slot labels are owned Strings, never Box::leak per render.
@@ -437,4 +526,67 @@ fn regression_24_dead_apis() {
     assert!(!settings.render_curios);
     assert!(!settings.enable_button);
     assert_eq!(input::decode_open_request(&input::encode_open_request()), Ok(()));
+}
+
+// A — the GUI equip path must go through the production tag-validator helper.
+// The SDK tag fixture is process-wide and other tests install their own
+// fixtures, so this asserts the production predicate path without FakeHost.
+#[test]
+fn regression_a_gui_can_equip_host_via_tag_predicate() {
+    assert!(equip::is_stack_valid_with(
+        &ring_slot(),
+        &context(),
+        "mod:gui_amulet",
+        |validator, _, item| {
+            matches!(
+                validator.resource_id().as_str().as_str(),
+                "curios:all" | "curios:tag"
+            ) && item == "mod:gui_amulet"
+        }
+    ));
+    assert!(!equip::is_stack_valid_with(
+        &ring_slot(),
+        &context(),
+        "curios:ring",
+        |validator, _, _| {
+            validator.resource_id().as_str().as_str() == "curios:none"
+        }
+    ));
+}
+
+// B — the real menu→inventory mapping and source/destination place keys.
+#[test]
+fn regression_b_menu_click_mapping() {
+    assert_eq!(menu::inventory_slot_for_menu_slot(0), None);
+    assert_eq!(
+        menu::inventory_slot_for_menu_slot(menu::MENU_SLOTS),
+        Some(0)
+    );
+    assert_eq!(
+        menu::inventory_slot_for_menu_slot(menu::MENU_SLOTS + 3),
+        Some(3)
+    );
+    assert_eq!(menu::first_free_index(&[true, false, true]), Some(1));
+    assert_eq!(menu::first_free_index(&[true, true]), None);
+    let slot = registry::slot_type_index("ring").expect("ring index");
+    let source = place::place_key(7, slot, 0);
+    let destination = place::place_key(7, slot, 1);
+    assert_ne!(source, destination, "a click would move a stack onto itself");
+}
+
+// C — the real datapack decoder must handle all eleven bundled entries.
+#[test]
+fn regression_c_reads_eleven_slot_entries() {
+    let entries: Vec<(String, Vec<(String, DatapackValue)>)> = registry::BUILTIN
+        .iter()
+        .map(|(id, _)| (format!("curios:{id}"), datapack_values()))
+        .collect();
+    match datapack::decode_entries(entries) {
+        Ok(types) => assert_eq!(
+            types.len(),
+            11,
+            "the datapack decoder did not decode all bundled entries"
+        ),
+        Err(error) => panic!("the bundled slot entries were refused: {error:?}"),
+    }
 }

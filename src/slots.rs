@@ -189,6 +189,14 @@ pub fn parse_qualified_slot_id(id: &str) -> Result<(String, String), InvalidSlot
     }
 }
 
+/// Extracts the bare slot id from either `ring` or `namespace:ring`.
+///
+/// Data-pack registry entries keep the qualified id as their map key, but
+/// `SlotType::from_definition` receives only the bare id (review C).
+pub fn slot_bare_id(id: &str) -> Result<String, InvalidSlotId> {
+    parse_qualified_slot_id(id).map(|(_, bare)| bare)
+}
+
 /// Normalises a bare or namespaced slot id to its canonical `namespace:id` form.
 pub fn qualify_slot_id(id: &str) -> String {
     match parse_qualified_slot_id(id) {

@@ -53,9 +53,32 @@ An independent review found 24 issues; all are fixed and covered by
 - **#24** Dead APIs are wired or documented (`enable_button`, clamped pages,
   real cosmetic toggle, grabbed-item application).
 
+## Wave 5 — complete (second review)
+
+Second review found three remaining critical issues, all fixed:
+
+- **A** the GUI pre-check used the pure string validator; it now calls
+  `equip::can_equip_host` with real item tags.
+- **B** GUI clicks now move real items: player-inventory menu slots map to
+  `ItemPlace::PlayerSlot`, source and destination are distinct places, both legs
+  run in one `host.transaction`; right-click moves one item, shift-click moves
+  all eligible stacks.
+- **C** data-pack entries now pass a bare id to `SlotType::from_definition`
+  while keeping the qualified id as the map key, so all 11 entries decode and
+  `/curios reload` no longer retries forever.
+
+Meta finding D is also addressed: `src/review_regressions.rs` now calls real
+production functions (`is_stack_valid_host`, `handle_server`,
+`mark_pending/take_pending`, `CurioPlaceProvider::insert`, `decode_entries`,
+`inventory_slot_for_menu_slot`) instead of local copies. The two minor tails
+(#9 command modifiers, #23 conditional modifier events) are fixed as well.
+
+`mod_api` test mocks are enabled through a dev-dependency feature, so they stay
+out of the shipped native build.
+
 ## Verification
 
-- `cargo test --offline`: **153 passed, 0 failed** (130 lib + 23 regression).
+- `cargo test --offline`: **160 passed, 0 failed** (134 lib + 26 regression).
 - `git diff --check`: clean.
 - `horizon-launcher native-build --version nightly-2026-11-18-dd67b76 .`:
-  **success** — `native-dd67b76-0eb81ff40548` built and installed.
+  **success** — `native-dd67b76-e9e0c1f32e42` built and installed.

@@ -182,6 +182,15 @@ fn snapshot_of(
     stack.map(|stack| ItemSnapshot::from_stack(host, stack)).transpose()
 }
 
+/// Whether the measured slot count really changed (review #23 tail).
+fn count_changed(before: Option<usize>, after: Option<usize>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => before != after,
+        // A failed read is not evidence of a resize: do not emit the event.
+        _ => false,
+    }
+}
+
 /// Current slot count for a place key, used to detect a real dynamic resize.
 fn slot_count(host: &mut dyn ServerHost, key: u64) -> Option<usize> {
     let (entity, type_index, _) = parse_key(key);
@@ -318,8 +327,7 @@ impl PlaceProvider for CurioPlaceProvider {
         match write_stack(host, key, Some(&next)) {
             Ok(()) => {
                 let after_count = slot_count(host, key);
-                let slot_count_changed =
-                    before_count.is_some_and(|before| after_count != Some(before));
+                let slot_count_changed = count_changed(before_count, after_count);
                 notify_change(
                     host,
                     entity,
@@ -405,8 +413,7 @@ impl PlaceProvider for CurioPlaceProvider {
         match write_stack(host, key, next.as_ref()) {
             Ok(()) => {
                 let after_count = slot_count(host, key);
-                let slot_count_changed =
-                    before_count.is_some_and(|before| after_count != Some(before));
+                let slot_count_changed = count_changed(before_count, after_count);
                 notify_change(
                     host,
                     entity,
@@ -459,6 +466,15 @@ mod tests {
         }
         assert!(curio_place(1, "ring", COSMETIC_FLAG).is_none());
         assert!(cosmetic_place(1, "ring", SLOT_MASK + 1).is_none());
+    }
+
+    #[test]
+    fn modifiers_event_requires_a_real_size_change() {
+        assert!(!count_changed(None, Some(2)));
+        assert!(!count_changed(Some(2), Some(2)));
+        assert!(!count_changed(Some(2), None));
+        assert!(count_changed(Some(2), Some(3)));
+        assert!(count_changed(Some(2), Some(1)));
     }
 
     #[test]

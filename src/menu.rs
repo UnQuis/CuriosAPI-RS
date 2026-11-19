@@ -622,95 +622,174 @@ pub fn open_vanilla(host: &mut dyn ServerHost, uuid: u128) -> bool {
     true
 }
 
-/// Server hook: a real item transaction. A click on a visible cell moves the
-/// stack between the vanilla menu slot and the Curio `ItemPlace::Mod`, after
-/// the same `canEquip`/`canUnequip` checks the API uses for any other equip.
-pub fn menu_clicked(host: &mut dyn ServerHost, uuid: u128, window: i32, raw_slot: i32) -> bool {
-    // #11: -999 must not become slot 0, and a click from another menu/window
-    // must never reach this player's Curio slots.
-    let Ok(slot) = usize::try_from(raw_slot) else {
-        return false;
-    };
-    if Some(window) != player_window(uuid) {
-        return false;
-    }
-    let per_page = usize::from(config::current().server.max_slots_per_page);
-    if slot >= per_page || slot >= MENU_SLOTS {
-        return false;
-    }
-    let Some(menu) = host.menu(uuid, window) else {
-        return false;
-    };
-    let state = player_state(uuid);
-    let Some(cell) = display_cells(state.page, state.cosmetic).get(slot).cloned() else {
-        return false;
-    };
-    let Some(player) = host.player(uuid) else {
-        return false;
-    };
-    let entity = player.entity().id();
-    let Some(target) = cell.place(entity) else {
-        return false;
-    };
-    let menu_place = ItemPlace::MenuSlot { menu, slot };
-    let menu_stack = menu_place.stack(host);
-    let curio_stack = target.stack(host);
-    let item_id = menu_stack
-        .as_ref()
-        .or(curio_stack.as_ref())
-        .map(|stack| stack.item().id(host))
-        .unwrap_or_default();
-    if item_id.is_empty() {
-        return false;
-    }
-    let context = SlotContext::new(
-        cell.slot_type.clone(),
-        Some(u64::from(entity)),
-        cell.index,
-        cell.cosmetic,
-        true,
-    );
-    let slot_type = registry::slot_types()
-        .iter()
-        .find(|candidate| candidate.id() == cell.slot_type)
-        .cloned();
-    let moving_in = menu_stack.is_some();
-    let allowed = if moving_in {
-        match slot_type.as_ref() {
-            Some(slot_type) => equip::can_equip(slot_type, &context, &item_id, TriState::Default),
-            None => false,
-        }
+/// Maps a menu slot in the player-inventory tail to Horizon's `PlayerSlot`
+/// number, or None for the menu's own container slots. The 9x6 chest has 54
+/// container slots followed by 36 inventory slots (hotbar first).
+pub fn inventory_slot_for_menu_slot(slot: usize) -> Option<i32> {
+    if slot >= MENU_SLOTS && slot < MENU_SLOTS + PLAYER_SLOTS {
+        i32::try_from(slot - MENU_SLOTS).ok()
     } else {
-        equip::can_unequip(&context, &item_id, TriState::Default)
-    };
-    if !allowed {
-        return false;
+        None
     }
-    let stack = match if moving_in { menu_stack.as_ref() } else { curio_stack.as_ref() } {
-        Some(stack) => stack,
-        None => return false,
-    };
-    let count = stack.count();
-    if count == 0 {
-        return false;
-    }
+}
+
+/// First empty slot of a 36-slot inventory, as a boolean occupancy slice.
+/// Pure so the source/destination mapping can be unit-tested.
+pub fn first_free_index(occupied: &[bool]) -> Option<usize> {
+    occupied.iter().position(|taken| !taken)
+}
+
+/// Moves `count` items in one journaled transaction between two distinct
+/// places. Either both legs succeed or neither does.
+fn transact_move(
+    host: &mut dyn ServerHost,
+    from: &ItemPlace,
+    to: &ItemPlace,
+    stack: &ItemStack,
+    count: u32,
+) -> bool {
     let resource = ItemResource::of(stack);
-    // Both legs are journaled in one transaction: a half move is never kept.
-    let moved: Result<u32, ()> = host.transaction(|host, tx| {
-        let (from, to) = if moving_in {
-            (&menu_place, &target)
-        } else {
-            (&target, &menu_place)
-        };
+    let moved: Result<(), ()> = host.transaction(|host, tx| {
         let inserted = to.insert(host, tx, &resource, count);
         if inserted != count {
             return Err(());
         }
         let extracted = from.extract(host, tx, &resource, count);
-        if extracted == count { Ok(count) } else { Err(()) }
+        if extracted == count { Ok(()) } else { Err(()) }
     });
     if moved.is_err() {
-        eprintln!("[curios] menu click transaction aborted for {item_id}");
+        eprintln!("[curios] item transaction aborted for {}", stack.item().id(host));
+    }
+    moved.is_ok()
+}
+
+/// Server hook: move real stacks between the player's inventory and Curio
+/// `ItemPlace::Mod`. The mirrored menu slots are never the source: clicking
+/// slot 54..89 addresses the player's own inventory, and clicking a cell
+/// unequips into the first free player slot.
+pub fn menu_clicked(
+    host: &mut dyn ServerHost,
+    uuid: u128,
+    window: i32,
+    raw_slot: i32,
+    button: i32,
+    mode: i32,
+) -> bool {
+    // -999 means "outside"; a negative index must never become slot 0.
+    let Ok(slot) = usize::try_from(raw_slot) else {
+        return false;
+    };
+    if Some(window) != player_window(uuid) || slot >= MENU_SLOTS + PLAYER_SLOTS {
+        return false;
+    }
+    let Some(player) = host.player(uuid) else {
+        return false;
+    };
+    let entity = player.entity().id();
+    let state = player_state(uuid);
+    let cells = display_cells(state.page, state.cosmetic);
+    let right_click = button == 1;
+    let quick_move = mode == 1;
+    let mut moved_any = false;
+
+    if let Some(inventory_index) = inventory_slot_for_menu_slot(slot) {
+        // Equip: source is the player's own slot, destination a Curio place.
+        let source = ItemPlace::PlayerSlot {
+            player: uuid,
+            slot: inventory_index,
+        };
+        let Some(stack) = source.stack(host) else {
+            return false;
+        };
+        let item_id = stack.item().id(host);
+        let count = stack.count();
+        if count == 0 {
+            return false;
+        }
+        let wanted = if right_click { 1 } else { count };
+        let mut remaining = wanted;
+        for cell in cells.iter().cloned() {
+            if remaining == 0 {
+                break;
+            }
+            let Some(place) = cell.place(entity) else {
+                continue;
+            };
+            if place.stack(host).is_some() {
+                continue;
+            }
+            let context = SlotContext::new(
+                cell.slot_type.clone(),
+                Some(u64::from(entity)),
+                cell.index,
+                cell.cosmetic,
+                true,
+            );
+            let Some(slot_type) = registry::slot_types()
+                .iter()
+                .find(|candidate| candidate.id() == cell.slot_type)
+                .cloned()
+            else {
+                continue;
+            };
+            if !equip::can_equip_host(
+                &*host,
+                &slot_type,
+                &context,
+                stack.item(),
+                &item_id,
+                TriState::Default,
+            ) {
+                continue;
+            }
+            let amount = remaining.min(stack.count());
+            if transact_move(host, &source, &place, &stack, amount) {
+                remaining -= amount;
+                moved_any = true;
+            }
+            if !quick_move {
+                break;
+            }
+        }
+    } else if let Some(cell) = cells.get(slot).cloned() {
+        // Unequip: source is a Curio place, destination a player slot.
+        let Some(place) = cell.place(entity) else {
+            return false;
+        };
+        let Some(stack) = place.stack(host) else {
+            return false;
+        };
+        let context = SlotContext::new(
+            cell.slot_type.clone(),
+            Some(u64::from(entity)),
+            cell.index,
+            cell.cosmetic,
+            true,
+        );
+        if !equip::can_unequip(&context, &stack.item().id(host), TriState::Default) {
+            return false;
+        }
+        let mut occupied = Vec::with_capacity(PLAYER_SLOTS);
+        let mut destinations = Vec::with_capacity(PLAYER_SLOTS);
+        for index in 0..PLAYER_SLOTS {
+            let destination = ItemPlace::PlayerSlot {
+                player: uuid,
+                slot: index as i32,
+            };
+            occupied.push(destination.stack(host).is_some());
+            destinations.push(destination);
+        }
+        let Some(free) = first_free_index(&occupied) else {
+            return false;
+        };
+        let count = if right_click { 1 } else { stack.count() };
+        let destination = &destinations[free];
+        moved_any = transact_move(host, &place, destination, &stack, count);
+    } else {
+        return false;
+    }
+
+    if !moved_any {
         return false;
     }
     let page = player_state(uuid).page;
@@ -1176,6 +1255,28 @@ mod tests {
         assert_eq!(state.page, 0);
         state.toggle_cosmetic();
         assert!(state.cosmetic);
+    }
+
+    #[test]
+    fn menu_slot_mapping_never_aliases_a_curio_place() {
+        assert_eq!(inventory_slot_for_menu_slot(MENU_SLOTS - 1), None);
+        assert_eq!(inventory_slot_for_menu_slot(MENU_SLOTS), Some(0));
+        assert_eq!(inventory_slot_for_menu_slot(MENU_SLOTS + 8), Some(8));
+        assert_eq!(inventory_slot_for_menu_slot(MENU_SLOTS + PLAYER_SLOTS - 1), Some(35));
+        assert_eq!(inventory_slot_for_menu_slot(MENU_SLOTS + PLAYER_SLOTS), None);
+        let inventory = ItemPlace::PlayerSlot {
+            player: 42,
+            slot: inventory_slot_for_menu_slot(MENU_SLOTS + 3).unwrap(),
+        };
+        let curio = place::curio_place(42, "ring", 3).unwrap();
+        assert_ne!(inventory, curio, "source and destination must differ");
+    }
+
+    #[test]
+    fn first_free_player_slot_is_the_first_gap() {
+        assert_eq!(first_free_index(&[true, true, false, true]), Some(2));
+        assert_eq!(first_free_index(&[]), None);
+        assert_eq!(first_free_index(&[true; PLAYER_SLOTS]), None);
     }
 
     #[test]

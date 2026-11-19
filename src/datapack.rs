@@ -32,7 +32,9 @@ use mod_api::{
 use crate::drop::DropRule;
 use crate::inventory;
 use crate::registry;
-use crate::slots::{DEFAULT_ORDER, SlotDefinition, SlotError, SlotType, TAG_VALIDATOR};
+use crate::slots::{
+    DEFAULT_ORDER, SlotDefinition, SlotError, SlotType, TAG_VALIDATOR, slot_bare_id,
+};
 
 /// Registry path declared inside the mod's namespace.
 pub const REGISTRY_PATH: &str = "slot_type";
@@ -48,7 +50,9 @@ pub fn mark_pending() {
     RELOAD_PENDING.store(true, Ordering::Release);
 }
 
-fn take_pending() -> bool {
+/// Consumes and returns the pending reload flag; public so integration tests
+/// can drive the same production state machine as `Hooks::server_tick`.
+pub fn take_pending() -> bool {
     RELOAD_PENDING.swap(false, Ordering::AcqRel)
 }
 
@@ -317,11 +321,31 @@ pub fn definition_from_fields(
     Ok((id, definition))
 }
 
+/// Decodes engine-provided registry entries into slot types.
+///
+/// The entry id stays qualified (`curios:ring`, `mymod:ring`) as the map key so
+/// namespaces cannot collide, while `SlotType` is built from the bare id
+/// (`ring`) as Java `ISlotType#getId` expects (review C).
+pub fn decode_entries<I>(entries: I) -> Result<Vec<SlotType>, ReloadError>
+where
+    I: IntoIterator<Item = (String, Vec<(String, DatapackValue)>)>,
+{
+    let mut decoded: BTreeMap<String, SlotType> = BTreeMap::new();
+    for (entry, values) in entries {
+        let (id, definition) = definition_from_fields(&entry, values)?;
+        let bare = slot_bare_id(&id)
+            .map_err(|error| ReloadError::Slot(SlotError::InvalidSlotId(error)))?;
+        // A later pack wins for duplicate qualified ids, as in Java datapacks.
+        decoded.insert(id, SlotType::from_definition(&bare, &definition)?);
+    }
+    if decoded.is_empty() {
+        return Err(ReloadError::EmptyRegistry);
+    }
+    Ok(decoded.into_values().collect())
+}
+
 /// Reads and decodes every entry of `curios:slot_type` in `dimension`.
-pub fn read_slot_types(
-    host: &dyn Host,
-    dimension: &str,
-) -> Result<Vec<SlotType>, ReloadError> {
+pub fn read_slot_types(host: &dyn Host, dimension: &str) -> Result<Vec<SlotType>, ReloadError> {
     let level: mod_api::LevelRef = host
         .level(dimension)
         .ok_or_else(|| ReloadError::NoLevel(dimension.to_owned()))?;
@@ -329,18 +353,12 @@ pub fn read_slot_types(
         .datapack_entries(host, REGISTRY_KEY)
         .ok_or(ReloadError::Read(DatapackReadError::UnknownRegistry))?;
 
-    let mut decoded: BTreeMap<String, SlotType> = BTreeMap::new();
+    let mut read = Vec::new();
     for entry in entries {
         let handle = level.datapack_handle(host, REGISTRY_KEY, &entry)?;
-        let values = level.datapack_read(host, &handle)?;
-        let (id, definition) = definition_from_fields(&entry, values)?;
-        // A later pack wins for duplicate slot ids, as in Java datapacks.
-        decoded.insert(id.clone(), SlotType::from_definition(&id, &definition)?);
+        read.push((entry, level.datapack_read(host, &handle)?));
     }
-    if decoded.is_empty() {
-        return Err(ReloadError::EmptyRegistry);
-    }
-    Ok(decoded.into_values().collect())
+    decode_entries(read)
 }
 
 /// Migrates every resident inventory row (players and mobs), including rows
@@ -427,8 +445,9 @@ pub fn reload(host: &mut dyn ServerHost, _event: &mut ServerTickEvent<'_>) {
     }
 }
 
-#[cfg(test)]
-fn values_from_flat_json(json: &str) -> Result<Vec<(String, DatapackValue)>, ReloadError> {
+/// Converts a flat registry JSON file into the field/value list the engine
+/// hands to `decode_entries`; used by tooling and by the shipped-entry tests.
+pub fn flat_json_values(json: &str) -> Result<Vec<(String, DatapackValue)>, ReloadError> {
     let parsed: serde_json::Value = serde_json::from_str(json)
         .map_err(|error| ReloadError::InvalidField("json".to_owned(), error.to_string()))?;
     let object = parsed
@@ -611,13 +630,24 @@ mod tests {
     fn shipped_slot_type_entries_decode_to_builtin_slots() {
         let builtins = registry::builtin_slot_types().unwrap();
         assert_eq!(FLAT_SLOTS.len(), 11);
-        for (id, json) in FLAT_SLOTS {
-            let values = values_from_flat_json(json).unwrap();
-            let (decoded_id, definition) =
-                definition_from_fields(&format!("curios:{id}"), values).unwrap();
-            assert_eq!(decoded_id, format!("curios:{id}"));
-            let slot = SlotType::from_definition(&decoded_id, &definition).unwrap();
-            assert_eq!(slot.id(), *id);
+        // Drive the same production decoder that `read_slot_types` uses with
+        // the exact field/value lists the engine hands it for our 11 files.
+        let entries = FLAT_SLOTS
+            .iter()
+            .map(|(id, json)| {
+                (
+                    format!("curios:{id}"),
+                    flat_json_values(json).expect("flat entry decodes"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let decoded = decode_entries(entries).expect("all 11 entries decode");
+        assert_eq!(decoded.len(), 11);
+        for (id, _) in FLAT_SLOTS {
+            let slot = decoded
+                .iter()
+                .find(|slot| slot.id() == *id && slot.qualified_id() == format!("curios:{id}"))
+                .unwrap_or_else(|| panic!("missing slot {id}"));
             let expected = builtins
                 .iter()
                 .find(|builtin| builtin.id() == *id)
@@ -627,14 +657,14 @@ mod tests {
             assert_eq!(slot.icon(), expected.icon(), "slot {id}");
             assert_eq!(slot.drop_rule(), expected.drop_rule(), "slot {id}");
             assert_eq!(slot.validators(), expected.validators(), "slot {id}");
-            assert_eq!(&slot, expected, "slot {id}");
+            assert_eq!(slot, expected, "slot {id}");
         }
     }
 
     #[test]
     fn namespaced_entries_do_not_collide() {
         let values =
-            values_from_flat_json(include_str!("../data/curios/curios/slot_type/ring.json"))
+            flat_json_values(include_str!("../data/curios/curios/slot_type/ring.json"))
                 .unwrap();
         let (curios_id, curios_def) = definition_from_fields("curios:ring", values.clone()).unwrap();
         let (mymod_id, mymod_def) = definition_from_fields("mymod:ring", values).unwrap();

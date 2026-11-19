@@ -273,7 +273,14 @@ impl Hooks for Curios {
 
     fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent) {
         // The GUI layer rejects negative slots and foreign windows itself.
-        menu::menu_clicked(host, event.uuid, event.window, event.slot);
+        menu::menu_clicked(
+            host,
+            event.uuid,
+            event.window,
+            event.slot,
+            event.button,
+            event.mode,
+        );
     }
 
     fn menu_closed(&self, _host: &mut dyn ServerHost, event: &mut MenuClosedEvent) {

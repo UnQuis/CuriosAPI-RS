@@ -280,14 +280,27 @@ fn resize(
 /// The permanent `ADD_VALUE` modifier a command leaves on the slot handler.
 /// Its amount is the difference from the slot definition's base, so a data
 /// reload recomputes the same count instead of reverting it.
-fn command_modifier(base: u32, target: usize) -> (SlotSizeModifier, bool) {
+fn command_modifier(current: usize, target: usize) -> (SlotSizeModifier, bool) {
     (
         SlotSizeModifier {
             operation: ModifierOperation::AddValue,
-            amount: target as f64 - f64::from(base),
+            amount: target as f64 - current as f64,
         },
         true, // permanent
     )
+}
+
+/// Adds the command's delta without removing or rewriting any existing
+/// modifier. Other mods' permanent `ADD_VALUE` modifiers are therefore kept,
+/// and the computed size stays `current + delta == target`.
+fn with_command_modifier(
+    existing: &[(SlotSizeModifier, bool)],
+    current: usize,
+    target: usize,
+) -> Vec<(SlotSizeModifier, bool)> {
+    let mut modifiers = existing.to_vec();
+    modifiers.push(command_modifier(current, target));
+    modifiers
 }
 
 /// Resizes one handler through its persistent modifiers, not by editing NBT
@@ -312,25 +325,12 @@ fn resize_slot(
         .slot(slot_id)
         .ok_or_else(|| format!("unknown slot type {slot_id}"))?
         .len();
-    let base = inventory
-        .slot(slot_id)
-        .ok_or_else(|| format!("unknown slot type {slot_id}"))?
-        .size_state()
-        .base;
     let handler = inventory
         .slot_mut(slot_id)
         .ok_or_else(|| format!("unknown slot type {slot_id}"))?;
-    // Commands own the single permanent ADD_VALUE modifier (Java's `curios:command`
-    // id); other mods' modifiers are kept.
-    let mut modifiers: Vec<(SlotSizeModifier, bool)> = handler
-        .size_modifiers()
-        .iter()
-        .filter(|(modifier, permanent)| {
-            !(*permanent && modifier.operation == ModifierOperation::AddValue)
-        })
-        .cloned()
-        .collect();
-    modifiers.push(command_modifier(base, target));
+    // Append a delta rather than deleting every permanent ADD_VALUE: a different
+    // mod's modifier must survive the command unchanged.
+    let modifiers = with_command_modifier(handler.size_modifiers(), old, target);
     handler.set_size_modifiers(modifiers);
     let invalid = handler.resize_to(target);
 
@@ -580,10 +580,9 @@ mod tests {
 
     #[test]
     fn a_command_modifier_survives_reload_and_recomputes_the_size() {
-        let base = 1u32;
         let state = SlotSizeState {
-            base,
-            modifiers: vec![command_modifier(base, 5)],
+            base: 1,
+            modifiers: vec![command_modifier(1, 5)],
         };
         assert_eq!(state.resize().size, 5);
         assert!(state.resize().changed);
@@ -595,7 +594,7 @@ mod tests {
         inventory
             .slot_mut("ring")
             .expect("ring slot exists")
-            .set_size_modifiers(vec![command_modifier(base, 5)]);
+            .set_size_modifiers(vec![command_modifier(1, 5)]);
         let codec = INVENTORY.codec.as_ref().expect("inventory has a codec");
         let encoded = (codec.encode)(&inventory).expect("encoding succeeds");
         let decoded = (codec.decode)(&encoded).expect("decoding succeeds");
@@ -603,6 +602,33 @@ mod tests {
             decoded.slot("ring").expect("ring survived").size_state().resize().size,
             5
         );
+    }
+
+    #[test]
+    fn a_command_resize_keeps_other_mods_permanent_modifiers() {
+        let foreign = (
+            SlotSizeModifier {
+                operation: ModifierOperation::AddValue,
+                amount: 2.0,
+            },
+            true,
+        );
+        let other = (
+            SlotSizeModifier {
+                operation: ModifierOperation::AddMultipliedBase,
+                amount: 0.0,
+            },
+            true,
+        );
+        let existing = vec![foreign, other];
+        let updated = with_command_modifier(&existing, 3, 6);
+        assert_eq!(&updated[..2], &existing[..], "a foreign modifier was rewritten");
+        assert_eq!(updated.len(), 3);
+        let state = SlotSizeState {
+            base: 1,
+            modifiers: updated,
+        };
+        assert_eq!(state.resize().size, 6);
     }
 
     #[test]
