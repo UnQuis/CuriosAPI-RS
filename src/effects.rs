@@ -14,9 +14,10 @@
 //! * Powder snow has no dedicated hook. [`living_breathe`] can keep air refilled
 //!   while a curio is worn, but it cannot change the block's suffocation rules.
 //! * Fortune/Looting: `get_enchantment_level` receives only a stack, never the
-//!   wearer, so [`apply_enchantment_bonus`] must be called by a caller that has
-//!   already resolved the wearer's effects. There is no global "mining luck"
-//!   hook for Curio slots.
+//!   wearer, and fires for unequipped stacks on both sides, so the hook is a
+//!   deliberate no-op ([`get_enchantment_level`]). [`apply_enchantment_bonus`]
+//!   is a pure helper for callers that can prove the owner; it is not wired to
+//!   the global hook. There is no global "mining luck" hook for Curio slots.
 //! * Mending: `player_item_mend` is observe-only (its `repair`/`experience`
 //!   fields are inputs, not edits), so a Curio Mending bonus cannot be injected
 //!   into the repair. [`mending_bonus`] computes the intended value only.
@@ -238,10 +239,11 @@ pub fn living_breathe(event: &mut LivingBreatheEvent<'_>) {
     }
 }
 
-/// `Hooks::get_enchantment_level` helper for a resolved wearer effect set.
+/// Applies a wearer's Fortune/Looting to an enchantment collection.
 ///
-/// Horizon gives only the stack here, so the caller supplies the effects it
-/// already aggregated from the wearer's inventory.
+/// This is NOT wired to `Hooks::get_enchantment_level` (which has no wearer;
+/// see [`ENCHANTMENT_HOOK_LIMITATION`]). Call it only from a caller that can
+/// prove which entity owns the stack and has that entity's effects.
 pub fn apply_enchantment_bonus(
     event: &mut GetEnchantmentLevelEvent<'_>,
     effects: &CurioEffects,
@@ -267,20 +269,30 @@ pub fn add_enchantment_bonus(enchantments: &mut ItemEnchantments, effects: &Curi
     }
 }
 
-/// `Hooks::get_enchantment_level` entry point.
+/// Why Curio Fortune/Looting cannot be added from the global enchantment hook.
 ///
-/// Horizon's event carries only the stack, not its wearer, so the caller must
-/// pass the entity id whose effects were captured by [`refresh_effects`].
-pub fn get_enchantment_level(event: &mut GetEnchantmentLevelEvent<'_>, entity_id: u32) {
-    apply_enchantment_bonus(event, &cached_effects(entity_id));
-}
+/// In the pinned SDK, `GetEnchantmentLevelEvent` has exactly three fields:
+/// `stack: &ItemStack`, `target: Option<&Identifier>` and
+/// `enchantments: &mut ItemEnchantments` (generated/mod_api_generated.rs:15635).
+/// `Hooks::get_enchantment_level` receives no `Host`, no entity and no wearer,
+/// and fires on both sides for every enchantment read (often many times per
+/// tick) on stacks that may not be equipped at all. Applying a cached wearer's
+/// effects here would grant bonuses from somebody else's curios to an arbitrary
+/// stack, so the hook is intentionally a no-op. `apply_enchantment_bonus`
+/// remains available only to callers that can prove the wearer independently.
+pub const ENCHANTMENT_HOOK_LIMITATION: &str = concat!(
+    "GetEnchantmentLevelEvent exposes only stack, target and enchantments; ",
+    "there is no host, entity or wearer in the hook, and it also fires for ",
+    "unequipped stacks on both sides. Wearer-scoped Curio bonuses cannot be ",
+    "attributed safely and are intentionally omitted."
+);
 
-/// Variant for callers that already resolved the wearer's effects.
-pub fn get_enchantment_level_with(
-    event: &mut GetEnchantmentLevelEvent<'_>,
-    effects: &CurioEffects,
-) {
-    apply_enchantment_bonus(event, effects);
+/// `Hooks::get_enchantment_level` entry point: deliberately applies nothing.
+///
+/// See [`ENCHANTMENT_HOOK_LIMITATION`] for the exact SDK evidence. Do not
+/// replace this with a cached-owner lookup: the event gives no owner to match.
+pub fn get_enchantment_level(event: &mut GetEnchantmentLevelEvent<'_>) {
+    let _ = event;
 }
 
 /// Intended Mending bonus; Horizon's `player_item_mend` cannot inject it.
@@ -379,6 +391,12 @@ mod tests {
             enchantments.level(&Identifier::parse("minecraft:looting").unwrap()),
             1
         );
+    }
+
+    #[test]
+    fn enchantment_hook_limitation_is_documented() {
+        assert!(ENCHANTMENT_HOOK_LIMITATION.contains("no host"));
+        assert!(ENCHANTMENT_HOOK_LIMITATION.contains("unequipped"));
     }
 
     #[test]

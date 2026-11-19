@@ -138,6 +138,7 @@ pub fn decide_death_drop_with_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drop::{DropRule, DropRules};
     use crate::slots::SlotContext;
 
     fn context(id: &str) -> SlotContext {
@@ -156,6 +157,51 @@ mod tests {
         assert!(!TriState::Default.apply(false));
         assert!(TriState::True.apply(false));
         assert!(!TriState::False.apply(true));
+    }
+
+    #[test]
+    fn drop_precedence_is_exhaustive_over_all_rules() {
+        let yes: fn(&&str) -> bool = |_| true;
+        let no: fn(&&str) -> bool = |_| false;
+        let resolve = |rules: &DropRules<fn(&&str) -> bool>, item, slot| {
+            drop::resolve_drop_rule(rules.overrides(), &"curios:ring", item, slot)
+        };
+
+        for item in DropRule::ALL {
+            for slot in DropRule::ALL {
+                let none: DropRules<fn(&&str) -> bool> = DropRules::new();
+                let expected = if item == DropRule::Default {
+                    slot
+                } else {
+                    item
+                };
+                assert_eq!(resolve(&none, item, slot), expected);
+
+                for override_rule in DropRule::ALL {
+                    let mut rules = DropRules::new();
+                    rules.add_override(yes, override_rule);
+                    let expected = if override_rule == DropRule::Default {
+                        slot
+                    } else {
+                        override_rule
+                    };
+                    assert_eq!(resolve(&rules, item, slot), expected);
+
+                    for second in DropRule::ALL {
+                        let mut chained = DropRules::new();
+                        chained.add_override(yes, override_rule);
+                        chained.add_override(yes, second);
+                        chained.add_override(no, DropRule::Destroy);
+                        let expected = if second == DropRule::Default {
+                            slot
+                        } else {
+                            second
+                        };
+                        assert_eq!(resolve(&chained, item, slot), expected);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

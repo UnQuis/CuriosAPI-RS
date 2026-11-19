@@ -2,48 +2,51 @@
 
 All work is integrated through pull request #1 on `port/horizon-core`.
 
-## Wave 1 — complete
+## Waves 1–3 — complete
 
-Slot model, inventory, item API, equip/drop decisions, Horizon place bridge,
-network transport, commands, GUI, rendering, attributes, events, data packs and
-item effects. See the PR description for the full list.
-
-## Wave 2 — complete
-
-| Area | Files | Result |
+| Wave | Scope | State |
 |---|---|---|
-| Full Java command set (`list/set/add/remove/clear/replace`) + 16-channel payload audit | `src/commands.rs`, `src/net.rs` | done |
-| GUI controls, tooltips, 19 locales, slot icons | `src/menu.rs`, `src/input.rs`, `src/lang.rs`, `assets/` | done |
-| `ItemPart` for piglin neutrality, break animation, tooltips | `src/itempart.rs` | done |
-| Equip-time validation, change events, behavior callbacks, dynamic slot sizes | `src/place.rs`, `src/equip.rs`, `src/events.rs`, `src/attributes.rs`, `src/inventory.rs` | done |
-| Effect helpers (Fortune/Looting, Mending observe, cached wearer effects) | `src/effects.rs` | done |
-| SDK/game pin updated to `dd67b76…` | `horizon-mod.toml`, `compatibility.json`, `Cargo.lock` | done |
+| 1 | Slot model, inventory, item API, equip/drop, place bridge, network, commands, GUI, rendering, attributes, events, data packs, effects | done |
+| 2 | Runtime equip events, full Java command set, `ItemPart`, dynamic slot sizes, all 16 payload handlers, locales, SDK pin `dd67b76` | done |
+| 3 | API guide + example, custom screen rendering, in-game gametests, data-pack entry files, safe enchantment behavior, robustness tests | done |
 
-### Runtime wiring added in wave 2
+### Wave 3 additions
 
-`PlaceProvider::insert/extract` now run `equip::can_equip` / `can_unequip`
-server-side before mutating, dispatch `CurioChangeEvent` and
-`SlotModifiersUpdatedEvent`, call `CurioBehavior::on_equip/on_unequip`, and send a
-point-to-point `sync_stack`. Slot sizes are recalculated through
-`SlotSizeState::resize` on data reload; removed stacks go to `invalid` and are
-dropped on the next tick.
+- `docs/API.md` and `docs/examples/curio_example.rs.txt` document the public API
+  for other mods (`register_curio`, event listeners, inventory reads, drop rules).
+- `src/gametests.rs` registers four in-game test functions and definitions
+  (`curios:registry`, `curios:inventory_codec`, `curios:place_keys`, `curios:drop_rules`)
+  using the vanilla empty structure template.
+- `src/menu.rs` now draws a true custom Curios screen: all 11 slot icons,
+  cosmetic pairs, hover, page controls, instrumented tooltips and server-side
+  state mirroring through a dedicated `curios:screen_state` payload. Equips
+  outside the menu also refresh the screen through `place::notify_change`.
+- `data/curios/curios/slot_type/*.json`: all 11 flat data-pack entries, decoded
+  back into the same slot types as the bundled definitions.
+- Robustness: property tests for NBT codec truncation, all place-key boundaries
+  and the full drop-precedence tree; command and malformed-payload edge cases.
 
-## Remaining Horizon limitations
+## Objective Horizon limitations (pin `dd67b76`)
 
-- No native mod-slot equip hook; moments are computed in our own attachment/
-  place bridge and exposed through our event registry.
-- No arbitrary `EquipmentSlotGroup`: Curio modifiers are gated behind the
-  `curios:attribute_modifiers` component and installed for the `any` group.
-- No real slots in a custom screen: the GUI mirrors stacks into a vanilla
-  `minecraft:generic_9x6` menu; custom graphics are drawn in screen hooks.
-- `player_item_mend` is observe-only, so a Curio Mending bonus is reported but
-  cannot be injected.
-- `get_enchantment_level` receives a stack without its wearer, so the prepared
-  `effects::get_enchantment_level` helper is not wired into a global hook yet.
+1. `data_pack_files` cannot deliver datapack-registry entries (closed kind set).
+2. `get_enchantment_level` has no wearer, so wearer-scoped Fortune/Looting
+   bonuses cannot be applied safely; the helper is intentionally a no-op in the
+   global hook.
+3. `EquipmentSlotGroup` is a fixed enum; only the `any` group is available for
+   Curio modifiers.
+4. There is no `on_unequip` hook; it is synthesized in `PlaceProvider::extract`.
+5. No equip-sound hook; sound comes only from `set_equipment`.
+6. Powder-snow behavior is approximated through `living_breathe`.
+7. `player_item_mend` is observe-only; Mending cannot be injected.
+8. Break/reequip animation suppression is an `ItemPart` client hook.
+9. Datapack fields are flat (Bool/Int/Float/Text/Identifier/Reference); nested
+   validator lists are compressed into a single identifier.
+10. Data maps are not synced to clients; attachment + `sync_stack` is used.
+11. There are no typed data-component types for mods; string ids and NBT are used.
 
 ## Verification
 
-- `cargo test --offline`: **98 passed, 0 failed**.
+- `cargo test --offline`: **118 passed, 0 failed**.
 - `git diff --check`: clean.
 - `horizon-launcher native-build --version nightly-2026-11-18-dd67b76 .`:
-  **success** — native mod `native-dd67b76-36a75a36398d` built and installed.
+  **success** — `native-dd67b76-63471837394f` built and installed.

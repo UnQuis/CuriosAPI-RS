@@ -30,6 +30,26 @@ pub const OPEN_REQUEST_VERSION: &str = "1";
 pub const RENDER_REQUEST_ID: &str = "curios:toggle_render";
 pub const RENDER_REQUEST_VERSION: &str = "1";
 
+/// Serverbound channel carrying the screen snapshot: page, cosmetic view and
+/// each displayed stack with its active/render flags. The attachment is not
+/// synced to clients at this revision, so the screen needs an explicit view.
+pub const SCREEN_STATE_ID: &str = "curios:screen_state";
+pub const SCREEN_STATE_VERSION: &str = "1";
+
+/// One cell of the wire snapshot. `flags`: bit 0 cosmetic, bit 1 active,
+/// bit 2 render, bit 3 has stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenCellWire {
+    pub index: u16,
+    pub flags: u8,
+    pub nbt: Vec<u8>,
+}
+
+pub const CELL_COSMETIC: u8 = 0b0000_0001;
+pub const CELL_ACTIVE: u8 = 0b0000_0010;
+pub const CELL_RENDER: u8 = 0b0000_0100;
+pub const CELL_HAS_STACK: u8 = 0b0000_1000;
+
 /// Channel carrying the remaining client menu requests (Java `client_page`,
 /// `toggle_cosmetics`, `destroy`, `open_vanilla`).
 pub const MENU_REQUEST_ID: &str = "curios:menu_request";
@@ -41,6 +61,73 @@ pub const ACTION_PAGE_PREV: u8 = 2;
 pub const ACTION_TOGGLE_COSMETICS: u8 = 3;
 pub const ACTION_DESTROY: u8 = 4;
 pub const ACTION_OPEN_VANILLA: u8 = 5;
+
+/// Encodes a screen snapshot. Layout: page, cosmetic, cell count, then for
+/// each cell `(index u16 LE, flags u8, nbt length u16 LE, nbt bytes)`.
+pub fn encode_screen_state(page: u8, cosmetic: bool, cells: &[ScreenCellWire]) -> PayloadBytes {
+    let mut bytes = vec![page, u8::from(cosmetic), cells.len() as u8];
+    for cell in cells {
+        bytes.extend_from_slice(&cell.index.to_le_bytes());
+        bytes.push(cell.flags);
+        let len = cell.nbt.len().min(u16::MAX as usize) as u16;
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(&cell.nbt[..usize::from(len)]);
+    }
+    PayloadBytes(bytes)
+}
+
+/// Decodes a snapshot strictly: every declared cell must be complete, and
+/// no trailing bytes are accepted.
+pub fn decode_screen_state(
+    bytes: &PayloadBytes,
+) -> Result<(u8, bool, Vec<ScreenCellWire>), PayloadHandleError> {
+    let invalid = || PayloadHandleError::Failed("malformed curios screen state".to_owned());
+    let mut iter = bytes.0.iter().copied();
+    let page = iter.next().ok_or_else(invalid)?;
+    let cosmetic = match iter.next().ok_or_else(invalid)? {
+        0 => false,
+        1 => true,
+        _ => return Err(invalid()),
+    };
+    let count = usize::from(iter.next().ok_or_else(invalid)?);
+    let mut cells = Vec::with_capacity(count);
+    for _ in 0..count {
+        let low = iter.next().ok_or_else(invalid)?;
+        let high = iter.next().ok_or_else(invalid)?;
+        let flags = iter.next().ok_or_else(invalid)?;
+        let nlo = iter.next().ok_or_else(invalid)?;
+        let nhi = iter.next().ok_or_else(invalid)?;
+        let len = usize::from(u16::from_le_bytes([nlo, nhi]));
+        let mut nbt = Vec::with_capacity(len);
+        for _ in 0..len {
+            nbt.push(iter.next().ok_or_else(invalid)?);
+        }
+        cells.push(ScreenCellWire {
+            index: u16::from_le_bytes([low, high]),
+            flags,
+            nbt,
+        });
+    }
+    if iter.next().is_some() {
+        return Err(invalid());
+    }
+    Ok((page, cosmetic, cells))
+}
+
+pub fn screen_state_payload_id() -> PayloadId {
+    PayloadId(SCREEN_STATE_ID.to_owned())
+}
+
+pub fn screen_state_payload_declaration() -> PayloadDeclaration {
+    PayloadDeclaration::new(
+        screen_state_payload_id(),
+        SCREEN_STATE_VERSION.to_owned(),
+        PayloadProtocol::Play,
+        PayloadDirection::ToClient,
+        false,
+        HandlerThread::Main,
+    )
+}
 
 /// Payload contents: a single action byte. Kept explicit so a truncated or
 /// malformed packet is refused instead of being treated as an open.
@@ -300,6 +387,28 @@ pub fn apply_grabbed_item(host: &mut dyn ClientHost, stack: &mod_api::ItemStack)
     host.give(stack.item(), stack.count()).is_ok()
 }
 
+/// Client handler for the screen snapshot.
+pub struct ScreenStateHandler;
+
+impl IPayloadHandler for ScreenStateHandler {
+    fn handle(
+        &self,
+        payload: PayloadBytes,
+        context: &mut dyn IPayloadContext,
+    ) -> Result<(), PayloadHandleError> {
+        let (page, cosmetic, cells) = decode_screen_state(&payload)?;
+        let host = context
+            .client_host()
+            .map_err(|error| PayloadHandleError::Failed(format!("{error:?}")))?;
+        crate::menu::apply_screen_state(host, page, cosmetic, &cells);
+        Ok(())
+    }
+}
+
+pub fn screen_state_handler() -> Arc<dyn IPayloadHandler> {
+    Arc::new(ScreenStateHandler)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +436,23 @@ mod tests {
         assert!(decode_open_request(&PayloadBytes(Vec::new())).is_err());
         assert!(decode_open_request(&PayloadBytes(vec![0b0000_0010])).is_err());
         assert!(decode_open_request(&PayloadBytes(vec![OPEN_ACTION, 0])).is_err());
+    }
+
+    #[test]
+    fn screen_state_round_trips_and_rejects_truncation() {
+        let cells = vec![
+            ScreenCellWire { index: 7, flags: CELL_ACTIVE | CELL_HAS_STACK, nbt: vec![1, 2, 3] },
+            ScreenCellWire { index: 9, flags: CELL_COSMETIC | CELL_RENDER, nbt: vec![] },
+        ];
+        let encoded = encode_screen_state(2, true, &cells);
+        assert_eq!(decode_screen_state(&encoded), Ok((2, true, cells.clone())));
+        let mut truncated = encode_screen_state(0, false, &[cells[0].clone()]).0;
+        truncated.pop();
+        assert!(decode_screen_state(&PayloadBytes(truncated)).is_err());
+        assert!(decode_screen_state(&PayloadBytes(vec![0, 2, 0])).is_err());
+        let declaration = screen_state_payload_declaration();
+        assert_eq!(declaration.id, screen_state_payload_id());
+        assert_eq!(declaration.direction, PayloadDirection::ToClient);
     }
 
     #[test]

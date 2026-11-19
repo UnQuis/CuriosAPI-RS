@@ -154,9 +154,41 @@ fn player_arg(invocation: &CommandInvocation) -> Option<PlayerRef> {
 
 fn slot_arg(invocation: &CommandInvocation, index: usize) -> Result<String, String> {
     match argument(invocation, index) {
-        Some(CommandArgumentValue::String(value)) => Ok(value.clone()),
-        _ => Err("expected a slot id".to_owned()),
+        Some(CommandArgumentValue::String(value)) if !value.is_empty() => Ok(value.clone()),
+        Some(_) => Err("the slot id is empty".to_owned()),
+        None => Err("a slot id is required".to_owned()),
     }
+}
+
+/// Validates an amount against the command's explicit bound. Negative and
+/// oversized requests are refused with a named reason before any mutation.
+fn amount_value(raw: i32) -> Result<usize, String> {
+    if raw < 0 {
+        return Err(format!("amount {raw} is negative"));
+    }
+    usize::try_from(raw)
+        .ok()
+        .filter(|value| *value <= MAX_SLOTS)
+        .ok_or_else(|| format!("amount {raw} exceeds the maximum of {MAX_SLOTS}"))
+}
+
+/// Validates an item count: strictly positive and bounded like a slot amount.
+fn count_value(raw: i32) -> Result<u32, String> {
+    if raw <= 0 {
+        return Err(format!("count {raw} must be positive"));
+    }
+    u32::try_from(raw)
+        .ok()
+        .filter(|value| *value <= MAX_SLOTS as u32)
+        .ok_or_else(|| format!("count {raw} exceeds the maximum of {MAX_SLOTS}"))
+}
+
+/// Validates a slot index, both as a number and as a place key component.
+fn index_value(raw: i32) -> Result<u16, String> {
+    if raw < 0 {
+        return Err(format!("slot index {raw} is negative"));
+    }
+    u16::try_from(raw).map_err(|_| format!("slot index {raw} is out of range"))
 }
 
 fn player_by_name(host: &dyn ServerHost, name: &str) -> Option<PlayerRef> {
@@ -224,11 +256,7 @@ fn resize(
     let words = tokens(event.command, &*host);
     let slot = slot_arg(event.command, 0)?;
     let player = target_player(host, event.command, words.get(3).map(String::as_str))?;
-    let amount = int_arg(event.command, 2, 1)?;
-    if amount < 0 {
-        return Err("amount must not be negative".to_owned());
-    }
-    let amount = usize::try_from(amount).map_err(|_| "amount is out of range".to_owned())?;
+    let amount = amount_value(int_arg(event.command, 2, 1)?)?;
     let uuid = player.uuid();
     let holder = Holder::Entity(player.entity().id());
     let inventory = INVENTORY.get(host, holder).map_err(|error| format!("{error:?}"))?;
@@ -393,17 +421,9 @@ fn clear(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Result<()
 
 fn replace(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Result<(), String> {
     let slot = slot_arg(event.command, 0)?;
-    let index = int_arg(event.command, 1, -1)?;
-    if index < 0 {
-        return Err("slot index must not be negative".to_owned());
-    }
-    let index = u16::try_from(index).map_err(|_| "slot index is out of range".to_owned())?;
+    let index = index_value(int_arg(event.command, 1, -1)?)?;
     let player = target_player(host, event.command, None)?;
-    let count = int_arg(event.command, 4, 1)?;
-    let count = u32::try_from(count).map_err(|_| "count must be positive".to_owned())?;
-    if count == 0 {
-        return Err("count must be positive".to_owned());
-    }
+    let count = count_value(int_arg(event.command, 4, 1)?)?;
     let stack = match argument(event.command, 3) {
         Some(CommandArgumentValue::Item(stack)) => stack.clone(),
         _ => return Err("an item argument is required after `with`".to_owned()),
@@ -581,5 +601,47 @@ mod tests {
         let types = registry::slot_types();
         assert!(types.iter().any(|slot| slot.id() == "ring"));
         assert!(slot_lines().len() > 1);
+    }
+
+    #[test]
+    fn invalid_amounts_counts_and_indices_are_explicitly_refused() {
+        assert_eq!(amount_value(3), Ok(3));
+        assert_eq!(amount_value(0), Ok(0));
+        assert!(amount_value(-1).unwrap_err().contains("negative"));
+        assert!(amount_value(MAX_SLOTS as i32 + 1)
+            .unwrap_err()
+            .contains("maximum"));
+        assert!(amount_value(i32::MAX).is_err());
+
+        assert_eq!(count_value(2), Ok(2));
+        assert!(count_value(0).unwrap_err().contains("positive"));
+        assert!(count_value(-3).unwrap_err().contains("positive"));
+        assert!(count_value(i32::MAX).is_err());
+
+        assert_eq!(index_value(4), Ok(4));
+        assert!(index_value(-1).unwrap_err().contains("negative"));
+        assert!(index_value(i32::MAX).unwrap_err().contains("range"));
+    }
+
+    #[test]
+    fn empty_slot_ids_are_refused() {
+        let mut invocation = CommandInvocation::new(
+            vec!["curios".to_owned(), "set".to_owned()],
+            Vec::new(),
+            mod_api::DimensionKey::OVERWORLD,
+            [0.0; 3],
+        );
+        assert!(slot_arg(&invocation, 0).unwrap_err().contains("required"));
+        invocation.arguments.push(mod_api::CommandArgument::new(
+            "slot".to_owned(),
+            CommandArgumentValue::String(String::new()),
+        ));
+        assert!(slot_arg(&invocation, 0).unwrap_err().contains("empty"));
+        invocation.arguments.clear();
+        invocation.arguments.push(mod_api::CommandArgument::new(
+            "slot".to_owned(),
+            CommandArgumentValue::String("ring".to_owned()),
+        ));
+        assert_eq!(slot_arg(&invocation, 0), Ok("ring".to_owned()));
     }
 }

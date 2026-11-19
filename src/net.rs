@@ -1252,6 +1252,53 @@ mod tests {
     }
 
     #[test]
+    fn truncated_and_random_payload_bodies_are_refused() {
+        let value = NetTag::Compound(vec![
+            NetEntry {
+                key: "id".to_owned(),
+                value: NetTag::String("minecraft:stone".to_owned()),
+            },
+            NetEntry {
+                key: "counts".to_owned(),
+                value: NetTag::List(vec![NetTag::Int(1), NetTag::Int(2)]),
+            },
+        ]);
+        let body = encode_payload(&value, 4096).unwrap();
+        assert!(body.len() > 4);
+        for cut in 0..body.len() {
+            assert!(
+                decode_payload::<NetTag>(&body[..cut]).is_err(),
+                "a body truncated to {cut} bytes was accepted"
+            );
+        }
+        for seed in 0..64u8 {
+            let bytes: Vec<u8> = (0..16).map(|i| seed.wrapping_add(i)).collect();
+            assert!(decode_payload::<NetTag>(&bytes).is_err());
+        }
+        let mut trailing = body.clone();
+        trailing.push(0);
+        assert!(decode_payload::<NetTag>(&trailing).is_err());
+    }
+
+    #[test]
+    fn a_truncated_client_request_is_never_dispatched() {
+        let request = ClientPacket::ToggleRender {
+            identifier: "ring".to_owned(),
+            index: 2,
+        };
+        let body = encode_payload(&request, 1024).unwrap();
+        for cut in 0..body.len() {
+            assert!(
+                decode_payload::<ClientPacket>(&body[..cut]).is_err(),
+                "truncated client request at {cut} decoded"
+            );
+        }
+        let mut corrupt = body;
+        corrupt[0] = 0xff; // no such variant tag
+        assert!(decode_payload::<ClientPacket>(&corrupt).is_err());
+    }
+
+    #[test]
     fn the_client_mirror_applies_single_slot_updates() {
         let handler = NetHandler {
             curio_id: "ring".to_owned(),

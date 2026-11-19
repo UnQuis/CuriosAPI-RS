@@ -18,11 +18,12 @@
 use std::sync::Mutex;
 
 use mod_api::{
-    ClientHost, DrawContext, Flow, Holder, ItemPlace, MenuReplace, ModContainer,
-    ScreenRenderBackgroundEvent, ScreenRenderPostEvent, ScreenView, ServerHost, Text,
+    ClientHost, Compound, DrawContext, Flow, Holder, ItemPlace, ItemStack, MenuReplace, ModContainer,
+    ScreenRenderBackgroundEvent, ScreenRenderPostEvent, ScreenView, ServerHost, Tag, Text,
 };
 
 use crate::config;
+use crate::input::{self, ScreenCellWire};
 use crate::lang;
 use crate::place;
 use crate::registry;
@@ -185,6 +186,27 @@ fn cell_total() -> usize {
         .sum()
 }
 
+/// One cell of the client's screen snapshot, resolved from a mod place on the
+/// server and decoded into a real item stack on the client.
+#[derive(Clone, Debug)]
+pub struct ScreenCell {
+    pub index: u16,
+    pub cosmetic: bool,
+    pub active: bool,
+    pub render: bool,
+    pub stack: Option<ItemStack>,
+    pub slot_type: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScreenSnapshot {
+    pub page: usize,
+    pub cosmetic: bool,
+    pub cells: Vec<ScreenCell>,
+}
+
+static SCREEN_STATE: Mutex<Option<ScreenSnapshot>> = Mutex::new(None);
+
 static STATE: Mutex<Option<MenuState>> = Mutex::new(None);
 
 /// Window id of the menu opened by this mod on the server. Client requests
@@ -226,26 +248,33 @@ pub struct Layout {
     pub panel: [f32; 4],
 }
 
-const SLOT_STEP: f32 = 18.0;
+const PANEL_W: f32 = 208.0;
+const SLOT_STEP: f32 = 20.0;
 const SLOT_INSET: f32 = 8.0;
-const SLOT_TOP: f32 = 18.0;
+const SLOT_TOP: f32 = 22.0;
+const SLOT_ICON: f32 = 18.0;
 const BUTTON_SIZE: f32 = 12.0;
 const BUTTON_Y: f32 = 4.0;
 
 impl Layout {
+    /// The custom screen is wider than the vanilla chest panel that backs it:
+    /// nine 20-pixel columns plus margins need at least 208 pixels.
     pub fn new(panel: [f32; 4]) -> Self {
-        Self { panel }
+        Self {
+            panel: [panel[0], panel[1], panel[2].max(PANEL_W), panel[3]],
+        }
     }
 
-    /// Rectangle of menu slot `index`, matching the vanilla chest layout.
+    /// Rectangle of custom cell `index`. This is our own grid, not a vanilla
+    /// chest slot: the engine's slots are only the container backing.
     pub fn slot_rect(&self, index: usize) -> [f32; 4] {
         let column = (index % MENU_COLUMNS) as f32;
         let row = (index / MENU_COLUMNS) as f32;
         [
             self.panel[0] + SLOT_INSET + column * SLOT_STEP,
             self.panel[1] + SLOT_TOP + row * SLOT_STEP,
-            16.0,
-            16.0,
+            SLOT_ICON,
+            SLOT_ICON,
         ]
     }
 
@@ -334,6 +363,10 @@ pub fn open(host: &mut dyn ServerHost, uuid: u128) -> bool {
     match opened {
         Ok(Some(window)) => {
             *window_guard = Some(window);
+            drop(window_guard);
+            if !sync_state(host, uuid) {
+                eprintln!("[curios] screen snapshot could not be sent to {uuid}");
+            }
             true
         }
         Ok(None) => {
@@ -352,6 +385,129 @@ pub fn open(host: &mut dyn ServerHost, uuid: u128) -> bool {
 pub fn refresh(host: &mut dyn ServerHost, uuid: u128, window: i32, page: usize) -> bool {
     let items = page_stacks(host, uuid, page);
     host.menu_set_items(uuid, window, items).is_ok()
+}
+
+/// Applies a server snapshot on the client. Stacks are decoded from the NBT
+/// carried in the payload; an undecodable stack is dropped with a diagnostic
+/// rather than shown as a misleading empty slot.
+pub fn apply_screen_state(
+    host: &mut dyn ClientHost,
+    page: u8,
+    cosmetic: bool,
+    wire: &[ScreenCellWire],
+) {
+    let types = display_cells(usize::from(page), cosmetic);
+    let mut cells = Vec::with_capacity(wire.len());
+    for entry in wire {
+        let slot_type = types
+            .get(usize::from(entry.index))
+            .map(|cell| cell.slot_type.clone())
+            .unwrap_or_default();
+        let stack = if entry.flags & input::CELL_HAS_STACK != 0 {
+            match Tag::from_network_bytes(&entry.nbt, None) {
+                Ok((tag, _)) => match Compound::try_from(tag) {
+                    Ok(compound) => match ItemStack::from_nbt(&*host, &compound) {
+                        Some(stack) => Some(stack),
+                        None => {
+                            eprintln!("[curios] screen stack could not be decoded at {}", entry.index);
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("[curios] screen stack root refused: {error:?}");
+                        None
+                    }
+                },
+                Err(error) => {
+                    eprintln!("[curios] screen stack NBT refused at {}: {error:?}", entry.index);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        cells.push(ScreenCell {
+            index: entry.index,
+            cosmetic: entry.flags & input::CELL_COSMETIC != 0,
+            active: entry.flags & input::CELL_ACTIVE != 0,
+            render: entry.flags & input::CELL_RENDER != 0,
+            stack,
+            slot_type,
+        });
+    }
+    let mut guard = SCREEN_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(ScreenSnapshot {
+        page: usize::from(page),
+        cosmetic,
+        cells,
+    });
+    drop(guard);
+    with_state((), |state| {
+        state.page = usize::from(page);
+        state.cosmetic = cosmetic;
+    });
+}
+
+/// Sends the current curio view to one player. The vanilla menu remains the
+/// container backing, but every visible stack is read from the mod places.
+pub fn sync_state(host: &mut dyn ServerHost, uuid: u128) -> bool {
+    let Some(player) = host.player(uuid) else {
+        return false;
+    };
+    let page = with_state(0, |state| state.page);
+    let cosmetic = with_state(false, |state| state.cosmetic);
+    let entity = player.entity().id();
+    let holder = Holder::Entity(entity);
+    let inventory = crate::inventory::INVENTORY.get(host, holder).ok();
+    let mut wire = Vec::new();
+    for (position, cell) in display_cells(page, cosmetic).into_iter().enumerate() {
+        if position > usize::from(u16::MAX) {
+            break;
+        }
+        let Some(place) = cell.place(entity) else {
+            continue;
+        };
+        let stack = place.stack(host);
+        let mut flags = 0u8;
+        if cell.cosmetic {
+            flags |= input::CELL_COSMETIC;
+        }
+        if let Some(handler) = inventory.as_ref().and_then(|inv| inv.slot(&cell.slot_type)) {
+            if handler.active(cell.index).unwrap_or(true) {
+                flags |= input::CELL_ACTIVE;
+            }
+            if handler.render(cell.index).unwrap_or(true) {
+                flags |= input::CELL_RENDER;
+            }
+        }
+        let mut nbt = Vec::new();
+        if let Some(stack) = stack.as_ref() {
+            match crate::inventory::ItemSnapshot::from_stack(&*host, stack) {
+                Ok(snapshot) => match Tag::from(snapshot.as_nbt()).to_network_bytes() {
+                    Ok(bytes) => {
+                        flags |= input::CELL_HAS_STACK;
+                        nbt = bytes;
+                    }
+                    Err(error) => {
+                        eprintln!("[curios] screen stack {position} NBT refused: {error:?}")
+                    }
+                },
+                Err(error) => eprintln!("[curios] screen stack {position} refused: {error:?}"),
+            }
+        }
+        wire.push(ScreenCellWire {
+            index: position as u16,
+            flags,
+            nbt,
+        });
+    }
+    let page_byte = u8::try_from(page).unwrap_or(u8::MAX);
+    let bytes = input::encode_screen_state(page_byte, cosmetic, &wire);
+    player
+        .send_payload(host, &input::screen_state_payload_id(), bytes)
+        .is_ok()
 }
 
 /// Visible functional slot currently under the pointer, if our menu is open.
@@ -386,7 +542,10 @@ pub fn toggle_render(host: &mut dyn ServerHost, uuid: u128, slot: usize) -> bool
     if handler.set_render(cell.index, !current).is_err() {
         return false;
     }
-    crate::inventory::INVENTORY.set(host, holder, inventory).is_ok()
+    if crate::inventory::INVENTORY.set(host, holder, inventory).is_err() {
+        return false;
+    }
+    sync_state(host, uuid)
 }
 
 /// Server handler for Java `client_page`. The window comes from the menu this
@@ -399,7 +558,8 @@ pub fn client_page(host: &mut dyn ServerHost, uuid: u128, next: bool) -> bool {
         state.advance(next);
     });
     let page = with_state(0, |state| state.page);
-    refresh(host, uuid, window, page)
+    let mirrored = refresh(host, uuid, window, page);
+    sync_state(host, uuid) && mirrored
 }
 
 /// Server handler for Java `toggle_cosmetics`. The cosmetic view swaps the
@@ -410,7 +570,8 @@ pub fn toggle_cosmetics(host: &mut dyn ServerHost, uuid: u128) -> bool {
     };
     with_state((), |state| state.toggle_cosmetic());
     let page = with_state(0, |state| state.page);
-    refresh(host, uuid, window, page)
+    let mirrored = refresh(host, uuid, window, page);
+    sync_state(host, uuid) && mirrored
 }
 
 /// Server handler for Java `destroy`: clear every functional and cosmetic
@@ -461,6 +622,9 @@ pub fn menu_clicked(host: &mut dyn ServerHost, uuid: u128, window: i32, slot: us
     if !refresh(host, uuid, window, page) {
         eprintln!("[curios] could not restore menu slot {slot} after a click");
     }
+    if !sync_state(host, uuid) {
+        eprintln!("[curios] screen snapshot could not be refreshed after a click");
+    }
     true
 }
 
@@ -473,6 +637,10 @@ pub fn menu_closed() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     window.take();
+    let mut screen = SCREEN_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    screen.take();
 }
 
 /// Client hook: initialise state when our menu screen opens.
@@ -496,28 +664,34 @@ pub fn screen_opening(view: &ScreenView<'_>) {
     }
 }
 
-/// Client hook: frames and labels are drawn under the menu's own stacks.
-pub fn screen_render_background(host: &dyn ClientHost, event: &mut ScreenRenderBackgroundEvent<'_>) {
+/// Sprite path for one cell. Cosmetic pairs share the upstream cosmetic icon.
+pub fn slot_icon(cell: &ScreenCell) -> String {
+    if cell.cosmetic {
+        "curios:slot/empty_cosmetic_slot".to_owned()
+    } else {
+        format!("curios:slot/empty_{}_slot", cell.slot_type)
+    }
+}
+
+/// Client hook: paints the Curios panel under the menu's own widgets. The
+/// vanilla chest is only the container backing; this is the screen the player
+/// actually sees.
+pub fn screen_render_background(_host: &dyn ClientHost, event: &mut ScreenRenderBackgroundEvent<'_>) {
     if !is_ours(event.screen) {
         return;
     }
-    let state = with_state(MenuState::new(), |state| {
-        state.origin = [event.screen.rect[0], event.screen.rect[1]];
-        state.clone()
-    });
-    let layout = Layout::new(event.screen.rect);
-    let cells = display_cells(state.page, state.cosmetic);
-    for (slot, cell) in cells.iter().enumerate().take(MENU_SLOTS) {
-        let rect = layout.slot_rect(slot);
-        let frame = if cell.cosmetic { 0xFF_A855C8 } else { 0xFF_6B5A8C };
-        event.draw.fill(
-            [rect[0] - 1.0, rect[1] - 1.0, rect[2] + 2.0, rect[3] + 2.0],
-            frame,
-        );
-        let label = lang::slot_name(lang::locale(host), &cell.slot_type)
-            .unwrap_or(cell.slot_type.as_str());
-        event.draw.text(label, [rect[0], rect[1] + rect[3] + 1.0], 0xFF_E8C56A, false);
-    }
+    let panel = Layout::new(event.screen.rect).panel;
+    let size = event.draw.size();
+    // Cover the vanilla chest panel and the player-inventory rows below it.
+    event.draw.fill([0.0, 0.0, size[0], size[1]], 0xFF_0B0812);
+    event.draw.fill(
+        [panel[0] - 6.0, panel[1] - 6.0, panel[2] + 12.0, panel[3] + 104.0],
+        0xFF_1B1628,
+    );
+    event.draw.fill(
+        [panel[0] - 2.0, panel[1] - 2.0, panel[2] + 4.0, panel[3] + 4.0],
+        0xFF_2E2545,
+    );
 }
 
 /// Client hook: buttons and hover tooltips are drawn over the screen.
@@ -536,8 +710,70 @@ pub fn screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPostEve
         state.clone()
     });
     let layout = Layout::new(event.screen.rect);
+    let locale = lang::locale(host);
+    let name = lang::lookup(locale, lang::KEY_NAME).unwrap_or("Curios");
+    event.draw.text(name, [layout.panel[0] + 8.0, layout.panel[1] + 5.0], 0xFF_E8C56A, true);
+    let per_page = usize::from(config::current().server.max_slots_per_page).max(1);
+    let pages = page_count(cell_total(), per_page);
+    let pattern = lang::lookup(locale, lang::KEY_PAGE).unwrap_or("%d / %d");
+    let label = pattern
+        .replacen("%d", &(state.page + 1).to_string(), 1)
+        .replacen("%d", &pages.to_string(), 1);
+    event.draw.text(
+        &label,
+        [layout.panel[0] + layout.panel[2] - 76.0, layout.panel[1] + 5.0],
+        0xFF_EFE7FF,
+        true,
+    );
+
+    // Draw every visible cell from the server snapshot, not from the vanilla
+    // menu slots. The engine's own stacks are underneath our opaque panel.
+    let snapshot = SCREEN_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(snapshot) = snapshot {
+        for (position, cell) in snapshot.cells.iter().enumerate().take(MENU_SLOTS) {
+            let rect = layout.slot_rect(position);
+            let frame = if hovered_slot == Some(position) {
+                0xFF_FFE08A
+            } else if cell.cosmetic {
+                0xFF_A855C8
+            } else {
+                0xFF_6B5A8C
+            };
+            event.draw.fill(
+                [rect[0] - 1.0, rect[1] - 1.0, rect[2] + 2.0, rect[3] + 2.0],
+                frame,
+            );
+            let sprite = slot_icon(cell);
+            if !event.draw.sprite(&sprite, [0.0, 0.0, 16.0, 16.0], rect, None) {
+                event.draw.fill(rect, 0xFF_120E1C);
+            }
+            if let Some(stack) = cell.stack.as_ref() {
+                event.draw.item_stack(stack, [rect[0] + 1.0, rect[1] + 1.0], SLOT_ICON - 2.0);
+            }
+            if !cell.render {
+                event.draw.fill(rect, 0x80_000000);
+            }
+            if !cell.active {
+                event.draw.text(
+                    lang::lookup(locale, lang::KEY_INACTIVE).unwrap_or("Inactive"),
+                    [rect[0], rect[1] + rect[3] - 6.0],
+                    0xFF_FF5555,
+                    false,
+                );
+            }
+            if cell.cosmetic {
+                event.draw.text("C", [rect[0] + rect[2] - 7.0, rect[1]], 0xFF_E879FF, true);
+            }
+            let label = lang::slot_name(locale, &cell.slot_type)
+                .unwrap_or(cell.slot_type.as_str());
+            event.draw.text(label, [rect[0], rect[1] + rect[3] + 1.0], 0xFF_8C7AA8, false);
+        }
+    }
+
     draw_button(event.draw, layout, Control::PagePrev, "<");
-    draw_button(event.draw, layout, Control::PageNext, ">");
     draw_button(
         event.draw,
         layout,
@@ -545,19 +781,42 @@ pub fn screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPostEve
         if state.cosmetic { "C" } else { "c" },
     );
     draw_button(event.draw, layout, Control::ToggleRender, "R");
-    let per_page = usize::from(config::current().server.max_slots_per_page).max(1);
-    let pages = page_count(cell_total(), per_page);
-    let pattern = lang::lookup(lang::locale(host), lang::KEY_PAGE).unwrap_or("%d / %d");
-    let label = pattern
-        .replacen("%d", &(state.page + 1).to_string(), 1)
-        .replacen("%d", &pages.to_string(), 1);
-    event.draw.text(&label, [layout.panel[0] + 8.0, layout.panel[1] + 5.0], 0xFF_EFE7FF, true);
+    draw_button(event.draw, layout, Control::PageNext, ">");
+
+    // Tooltips are drawn with plain text: the block-scoped screen_tooltip hook
+    // cannot fire for Curios, which has no block.
     if let Some(index) = hovered_slot {
-        let cells = display_cells(state.page, state.cosmetic);
-        if let Some(cell) = cells.get(index) {
-            let lines = tooltip_lines(host, cell, false);
-            if let Err(error) = event.draw.gui_tooltip(&lines, event.screen.mouse) {
-                eprintln!("[curios] could not draw slot tooltip: {error:?}");
+        let snapshot = SCREEN_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(cell) = snapshot.and_then(|snapshot| snapshot.cells.into_iter().nth(index)) {
+            let mut lines = vec![
+                lang::slot_name(locale, &cell.slot_type)
+                    .unwrap_or(cell.slot_type.as_str())
+                    .to_owned(),
+            ];
+            if cell.cosmetic {
+                lines.push(
+                    lang::lookup(locale, lang::KEY_COSMETIC)
+                        .unwrap_or("Cosmetic")
+                        .to_owned(),
+                );
+            }
+            if !cell.active {
+                lines.push(
+                    lang::lookup(locale, lang::KEY_INACTIVE)
+                        .unwrap_or("Inactive")
+                        .to_owned(),
+                );
+            }
+            for (line, text) in lines.iter().enumerate() {
+                event.draw.text(
+                    text,
+                    [event.screen.mouse[0] + 8.0, event.screen.mouse[1] + 12.0 + line as f32 * 10.0],
+                    0xFF_EFE7FF,
+                    true,
+                );
             }
         }
     }
@@ -602,7 +861,7 @@ pub fn screen_tooltip(
     lines: &mut Vec<String>,
 ) {
     let state = with_state(MenuState::new(), |state| state.clone());
-    let control = Layout::new([state.origin[0], state.origin[1], 176.0, 256.0]).hit(at);
+    let control = Layout::new([state.origin[0], state.origin[1], PANEL_W, 256.0]).hit(at);
     let Control::Slot(index) = control else {
         return;
     };
@@ -705,8 +964,8 @@ mod tests {
     #[test]
     fn slots_follow_the_vanilla_grid() {
         let layout = layout();
-        assert_eq!(layout.slot_rect(0), [108.0, 68.0, 16.0, 16.0]);
-        assert_eq!(layout.slot_rect(9), [108.0, 86.0, 16.0, 16.0]);
+        assert_eq!(layout.slot_rect(0), [108.0, 72.0, 18.0, 18.0]);
+        assert_eq!(layout.slot_rect(9), [108.0, 92.0, 18.0, 18.0]);
         let panel_end = layout.panel[0] + layout.panel[2];
         assert!(layout.slot_rect(MENU_SLOTS - 1)[0] + 16.0 <= panel_end);
     }
@@ -759,6 +1018,62 @@ mod tests {
             }
         }
         assert_eq!(lang::lookup(lang::DEFAULT_LOCALE, lang::KEY_INACTIVE), Some("Inactive"));
+    }
+
+    #[test]
+    fn custom_grid_hits_every_rendered_cell() {
+        let layout = layout();
+        for index in 0..MENU_SLOTS {
+            let rect = layout.slot_rect(index);
+            let at = [rect[0] + 2.0, rect[1] + 2.0];
+            assert_eq!(layout.hit(at), Control::Slot(index), "cell {index}");
+        }
+        assert_eq!(layout.hit([layout.panel[0] + 200.0, layout.panel[1]]), Control::None);
+    }
+
+    #[test]
+    fn icon_paths_cover_all_eleven_slot_types() {
+        for id in [
+            "curio", "head", "necklace", "back", "body", "bracelet", "hands", "ring", "belt",
+            "feet", "charm",
+        ] {
+            let cell = ScreenCell {
+                index: 0,
+                cosmetic: false,
+                active: true,
+                render: true,
+                stack: None,
+                slot_type: id.to_owned(),
+            };
+            assert_eq!(slot_icon(&cell), format!("curios:slot/empty_{id}_slot"));
+        }
+        let cosmetic = ScreenCell {
+            cosmetic: true,
+            ..ScreenCell {
+                index: 0,
+                cosmetic: false,
+                active: true,
+                render: true,
+                stack: None,
+                slot_type: "ring".to_owned(),
+            }
+        };
+        assert_eq!(slot_icon(&cosmetic), "curios:slot/empty_cosmetic_slot");
+    }
+
+    #[test]
+    fn pages_partition_cells_without_gaps_or_overlaps() {
+        let total = cell_total();
+        let per_page = usize::from(config::current().server.max_slots_per_page);
+        let mut seen = Vec::new();
+        for page in 0..page_count(total, per_page) {
+            for cell in display_cells(page, false) {
+                seen.push((cell.slot_type, cell.index));
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), total);
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub mod effects;
 pub mod equip;
 pub mod events;
 pub mod input;
+pub mod gametests;
 pub mod inventory;
 pub mod itempart;
 pub mod lang;
@@ -70,6 +71,11 @@ impl Hooks for Curios {
             Some(input::menu_handler()),
             None,
         );
+        r.add_payload(
+            input::screen_state_payload_declaration(),
+            None,
+            Some(input::screen_state_handler()),
+        );
         for (id, default) in [
             (PAGE_NEXT_KEY, "]"),
             (PAGE_PREV_KEY, "["),
@@ -86,6 +92,10 @@ impl Hooks for Curios {
         if let Err(error) = datapack::declare(r) {
             eprintln!("[curios] slot-type registry declaration failed: {error:?}");
         }
+    }
+
+    fn register_game_tests(&self, host: &dyn Host, event: &mut RegisterGameTestsEvent<'_>) {
+        gametests::register(host, event);
     }
 
     fn register_configs(&self, _host: HostSide<'_>, event: &mut RegisterConfigsEvent<'_>) {

@@ -1,11 +1,18 @@
 //! Data-driven slot types through a Horizon datapack registry.
 //!
 //! Declares `curios:slot_type` with the flat schema Horizon allows
-//! (`docs/research/horizon-api.md` §4), ships the eleven bundled slot files as
-//! flat JSON through `data_pack_files`, and rebuilds the slot registry from
+//! (`docs/research/horizon-api.md` §4) and rebuilds the slot registry from
 //! `LevelRef::datapack_entries/handle/read`. A reload is deferred to
 //! `server_tick`: data is reloaded before players are available, as in
 //! `ProjectE-RS`.
+//!
+//! **No `data_pack_files` contribution is possible for registry entries.**
+//! The hook accepts only `<kind>/<namespace>:<path>` keys for the tables it
+//! reads (`recipe`, `tags`, `loot_table`, `advancement`, `trade_set`,
+//! `villager_trade`, `dialog`, `data_maps`); a mod-declared registry is not one
+//! of those kinds. Entries are read from real pack files at the exact path
+//! returned by [`entry_file`], i.e. `data/curios/curios/slot_type/<id>.json`.
+//! [`data_pack_files`] therefore only marks a pending rebuild.
 //!
 //! Adapted from `CuriosSlotResources#populateData` and
 //! `CuriosCommonEvents` of TheIllusiveC4/Curios (LGPL-3.0-or-later,
@@ -33,9 +40,6 @@ pub const REGISTRY_PATH: &str = "slot_type";
 pub const REGISTRY_KEY: &str = "curios:slot_type";
 /// Dimension queried for the server-wide datapack registry set.
 pub const DEFAULT_DIMENSION: &str = "overworld";
-
-/// Component id of the shipped flat registry files, before the entry id.
-const FILE_KIND: &str = "curios/slot_type";
 
 static RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -165,8 +169,20 @@ pub fn declare(r: &mut dyn Registrar) -> Result<(), DatapackRegistrationError> {
     )
 }
 
-/// Flattens a bundled slot definition to the registry schema.
-fn flat_entry(id: &str, definition: &SlotDefinition) -> String {
+/// Exact data-pack path Horizon uses for one `curios:slot_type` entry.
+///
+/// This mirrors `DatapackRegistryDeclaration::entry_file`:
+/// `data/<entry namespace>/<registry namespace>/<registry path>/<entry>.json`.
+pub fn entry_file(id: &str) -> Option<String> {
+    if id.is_empty() || id.contains('/') || id.contains(':') {
+        return None;
+    }
+    Some(format!("data/curios/curios/slot_type/{id}.json"))
+}
+
+/// Flattens a bundled slot definition to the registry schema, for generators
+/// that write the real pack files at [`entry_file`] paths.
+pub fn flat_entry(id: &str, definition: &SlotDefinition) -> String {
     let mut object = serde_json::Map::new();
     object.insert(
         "order".to_owned(),
@@ -218,19 +234,13 @@ fn flat_entry(id: &str, definition: &SlotDefinition) -> String {
     serde_json::Value::Object(object).to_string()
 }
 
-/// Contributes all bundled slot files through `Hooks::data_pack_files` and
-/// marks the next server tick for a rebuild.
-pub fn data_pack_files(event: &mut DataPackFilesEvent<'_>) {
+/// Marks the next server tick for a rebuild when data packs are reloaded.
+///
+/// No files are contributed: the SDK's `data_pack_files` keys are only for the
+/// kinds its tables read, and a mod-declared datapack registry is not among
+/// them. Entries must be real pack files at [`entry_file`] paths.
+pub fn data_pack_files(_event: &mut DataPackFilesEvent<'_>) {
     mark_pending();
-    for (id, json) in registry::BUILTIN {
-        match SlotDefinition::from_json(json) {
-            Ok(definition) => {
-                let path = format!("{FILE_KIND}/curios:{id}");
-                event.files.push((path, flat_entry(id, &definition).into_bytes()));
-            }
-            Err(error) => eprintln!("[curios] bundled slot `{id}` is malformed: {error}"),
-        }
-    }
 }
 
 fn required<'a>(
@@ -373,8 +383,65 @@ pub fn reload(host: &mut dyn ServerHost, _event: &mut ServerTickEvent<'_>) {
 }
 
 #[cfg(test)]
+fn values_from_flat_json(json: &str) -> Result<Vec<(String, DatapackValue)>, ReloadError> {
+    let parsed: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| ReloadError::InvalidField("json".to_owned(), error.to_string()))?;
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| ReloadError::InvalidField("json".to_owned(), "not an object".to_owned()))?;
+    let mut values = Vec::new();
+    for field in schema_fields() {
+        let raw = object.get(&field.name).ok_or_else(|| {
+            ReloadError::InvalidField(field.name.clone(), "missing".to_owned())
+        })?;
+        let value = match field.kind {
+            DatapackFieldKind::Bool => DatapackValue::Bool(
+                raw.as_bool()
+                    .ok_or_else(|| ReloadError::InvalidField(field.name.clone(), format!("{raw}")))?,
+            ),
+            DatapackFieldKind::Int { .. } => DatapackValue::Int(
+                raw.as_i64()
+                    .ok_or_else(|| ReloadError::InvalidField(field.name.clone(), format!("{raw}")))?,
+            ),
+            DatapackFieldKind::Text { .. } | DatapackFieldKind::Identifier => {
+                DatapackValue::Text(
+                    raw.as_str()
+                        .ok_or_else(|| {
+                            ReloadError::InvalidField(field.name.clone(), format!("{raw}"))
+                        })?
+                        .to_owned(),
+                )
+            }
+            _ => {
+                return Err(ReloadError::InvalidField(
+                    field.name.clone(),
+                    "unsupported field kind".to_owned(),
+                ))
+            }
+        };
+        values.push((field.name.clone(), value));
+    }
+    Ok(values)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The eleven flat entries shipped at the SDK registry path.
+    const FLAT_SLOTS: &[(&str, &str)] = &[
+        ("curio", include_str!("../data/curios/curios/slot_type/curio.json")),
+        ("head", include_str!("../data/curios/curios/slot_type/head.json")),
+        ("necklace", include_str!("../data/curios/curios/slot_type/necklace.json")),
+        ("back", include_str!("../data/curios/curios/slot_type/back.json")),
+        ("body", include_str!("../data/curios/curios/slot_type/body.json")),
+        ("bracelet", include_str!("../data/curios/curios/slot_type/bracelet.json")),
+        ("hands", include_str!("../data/curios/curios/slot_type/hands.json")),
+        ("ring", include_str!("../data/curios/curios/slot_type/ring.json")),
+        ("belt", include_str!("../data/curios/curios/slot_type/belt.json")),
+        ("feet", include_str!("../data/curios/curios/slot_type/feet.json")),
+        ("charm", include_str!("../data/curios/curios/slot_type/charm.json")),
+    ];
 
     #[test]
     fn schema_is_flat_and_defaults_match() {
@@ -401,6 +468,32 @@ mod tests {
             ));
         }
         assert_eq!(REGISTRY_KEY, "curios:slot_type");
+    }
+
+    #[test]
+    fn registry_entry_path_matches_sdk_declaration() {
+        assert_eq!(
+            entry_file("ring").as_deref(),
+            Some("data/curios/curios/slot_type/ring.json")
+        );
+        assert_eq!(
+            entry_file("back").as_deref(),
+            Some("data/curios/curios/slot_type/back.json")
+        );
+        assert!(entry_file("").is_none());
+        assert!(entry_file("curios:ring").is_none());
+        assert!(entry_file("armor/ring").is_none());
+    }
+
+    #[test]
+    fn data_pack_files_adds_no_registry_entries() {
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut event = DataPackFilesEvent { files: &mut files };
+        data_pack_files(&mut event);
+        // The SDK exposes no overlay key that the registry decoder reads;
+        // contributing `curios/slot_type/curios:<id>` would be silently ignored.
+        assert!(files.is_empty());
+        assert!(take_pending());
     }
 
     #[test]
@@ -465,6 +558,29 @@ mod tests {
             definition_from_fields("curios:ring", values),
             Err(ReloadError::InvalidField(name, _)) if name == "order"
         ));
+    }
+
+    #[test]
+    fn shipped_slot_type_entries_decode_to_builtin_slots() {
+        let builtins = registry::builtin_slot_types().unwrap();
+        assert_eq!(FLAT_SLOTS.len(), 11);
+        for (id, json) in FLAT_SLOTS {
+            let values = values_from_flat_json(json).unwrap();
+            let (decoded_id, definition) =
+                definition_from_fields(&format!("curios:{id}"), values).unwrap();
+            assert_eq!(decoded_id, *id);
+            let slot = SlotType::from_definition(&decoded_id, &definition).unwrap();
+            let expected = builtins
+                .iter()
+                .find(|builtin| builtin.id() == *id)
+                .unwrap();
+            assert_eq!(slot.order(), expected.order(), "slot {id}");
+            assert_eq!(slot.size(), expected.size(), "slot {id}");
+            assert_eq!(slot.icon(), expected.icon(), "slot {id}");
+            assert_eq!(slot.drop_rule(), expected.drop_rule(), "slot {id}");
+            assert_eq!(slot.validators(), expected.validators(), "slot {id}");
+            assert_eq!(&slot, expected, "slot {id}");
+        }
     }
 
     #[test]

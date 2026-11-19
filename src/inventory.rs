@@ -652,6 +652,78 @@ mod tests {
     }
 
     #[test]
+    fn codec_rejects_truncated_and_broken_compounds() {
+        assert_eq!(
+            decode_inventory(&Compound::new()),
+            Err(AttachmentError::Decode)
+        );
+
+        let mut missing_invalid = Compound::new();
+        missing_invalid.insert("slots".into(), Tag::Compound(Compound::new()));
+        assert_eq!(
+            decode_inventory(&missing_invalid),
+            Err(AttachmentError::Decode)
+        );
+
+        let mut wrong_slots = Compound::new();
+        wrong_slots.insert("slots".into(), Tag::List(Vec::new()));
+        wrong_slots.insert("invalid".into(), Tag::List(Vec::new()));
+        assert_eq!(decode_inventory(&wrong_slots), Err(AttachmentError::Decode));
+
+        // A handler without the size fields is a truncated record, not a
+        // default-sized slot: decoding must fail loudly.
+        let mut handler = Compound::new();
+        handler.insert("stacks".into(), Tag::List(Vec::new()));
+        handler.insert("cosmetic".into(), Tag::List(Vec::new()));
+        handler.insert("render".into(), Tag::List(Vec::new()));
+        handler.insert("active".into(), Tag::List(Vec::new()));
+        handler.insert("drop_rule".into(), Tag::String("default".into()));
+        handler.insert("use_native_gui".into(), Tag::Byte(1));
+        let mut slots = Compound::new();
+        slots.insert("ring".into(), Tag::Compound(handler));
+        let mut truncated = Compound::new();
+        truncated.insert("slots".into(), Tag::Compound(slots));
+        truncated.insert("invalid".into(), Tag::List(Vec::new()));
+        assert_eq!(decode_inventory(&truncated), Err(AttachmentError::Decode));
+
+        // A modifier missing its operation is rejected as well.
+        let mut broken = encode_inventory(&CurioInventory::from_slot_types(&[slot()])).unwrap();
+        if let Some(Tag::Compound(slots)) = broken.get_mut(&"slots".into()) {
+            if let Some(Tag::Compound(handler)) = slots.get_mut(&"ring".into()) {
+                handler.insert(
+                    "modifiers".into(),
+                    Tag::List(vec![Tag::compound([(
+                        "amount",
+                        Tag::Double(1.0_f64.to_bits()),
+                    )])]),
+                );
+            }
+        }
+        assert_eq!(decode_inventory(&broken), Err(AttachmentError::Decode));
+    }
+
+    #[test]
+    fn codec_round_trip_property_over_sizes_and_amounts() {
+        use crate::attributes::ModifierOperation;
+
+        for size in 0..=5 {
+            for amount in [-1.0, 0.0, 2.5] {
+                let slot = SlotType::new("ring").unwrap().with_size(size);
+                let mut inventory = CurioInventory::from_slot_types(&[slot]);
+                inventory.slot_mut("ring").unwrap().set_size_modifiers(vec![(
+                    SlotSizeModifier {
+                        operation: ModifierOperation::AddValue,
+                        amount,
+                    },
+                    true,
+                )]);
+                let encoded = encode_inventory(&inventory).unwrap();
+                assert_eq!(decode_inventory(&encoded).unwrap(), inventory);
+            }
+        }
+    }
+
+    #[test]
     fn malformed_codec_is_refused() {
         let mut nbt = Compound::new();
         nbt.insert("slots".into(), Tag::List(Vec::new()));

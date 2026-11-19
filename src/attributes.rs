@@ -188,6 +188,17 @@ where
 }
 
 impl SlotFilter {
+    /// Whether this filter is the unrestricted `SlotTypePredicate::ANY`.
+    /// Only such entries are safe to bridge through the slot-less Horizon
+    /// `item_attribute_modifier` hook.
+    pub fn is_any(&self) -> bool {
+        self.ids.is_empty()
+            && self.size.is_none()
+            && self.drop_rule.is_none()
+            && self.add_cosmetic.is_none()
+            && self.render_toggle.is_none()
+    }
+
     /// Converts the serde shape into the domain predicate from `slots.rs`.
     pub fn predicate(&self) -> SlotTypePredicate {
         SlotTypePredicate {
@@ -301,11 +312,17 @@ impl CurioAttributeModifiers {
     /// Resolves vanilla-attribute entries for the Horizon bridge.
     ///
     /// Slot pseudo-attributes are excluded: Horizon has no slot attribute, so
-    /// those entries are applied through [`SlotSizeState`] instead.
+    /// those entries are applied through [`SlotSizeState`] instead. Entries
+    /// scoped to a slot are excluded too, because `item_attribute_modifier`
+    /// receives no slot context; applying them everywhere would grant the
+    /// bonus in unrelated slots.
     pub fn for_horizon(&self) -> Vec<ResolvedModifier> {
         self.modifiers()
             .iter()
-            .filter(|entry| matches!(entry.target, AttributeTarget::Vanilla(_)))
+            .filter(|entry| {
+                matches!(entry.target, AttributeTarget::Vanilla(_))
+                    && entry.slot.as_ref().is_none_or(SlotFilter::is_any)
+            })
             .map(|entry| {
                 ResolvedModifier::new(
                     entry.target.attribute_id(),
@@ -594,6 +611,49 @@ mod tests {
             "curios:boost/ring/3"
         );
         assert!(component.for_slot_context("head", 0).is_empty());
+    }
+
+    #[test]
+    fn horizon_bridge_excludes_slot_scoped_modifiers() {
+        let scoped = ModifierEntry {
+            target: AttributeTarget::Vanilla("minecraft:generic.max_health".to_owned()),
+            modifier: spec("curios:scoped", 1.0, ModifierOperation::AddValue),
+            slot: Some(SlotFilter {
+                ids: vec!["ring".to_owned()],
+                ..SlotFilter::default()
+            }),
+        };
+        let global = ModifierEntry {
+            target: AttributeTarget::Vanilla("minecraft:generic.max_health".to_owned()),
+            modifier: spec("curios:global", 2.0, ModifierOperation::AddValue),
+            slot: None,
+        };
+        let component = CurioAttributeModifiers::List(vec![
+            scoped,
+            global,
+            slot_entry("ring", spec("curios:slots", 1.0, ModifierOperation::AddValue)),
+        ]);
+        let bridged: Vec<String> = component
+            .for_horizon()
+            .into_iter()
+            .map(|modifier| modifier.id)
+            .collect();
+        assert_eq!(bridged, ["curios:global"]);
+
+        let ring = SlotType::new("ring").unwrap();
+        let head = SlotType::new("head").unwrap();
+        assert!(component
+            .for_slot_type(&ring)
+            .iter()
+            .any(|modifier| modifier.id == "curios:scoped/ring"));
+        assert!(component
+            .for_slot_type(&head)
+            .iter()
+            .all(|modifier| modifier.id != "curios:scoped/head"));
+        assert!(component
+            .for_slot_context("head", 0)
+            .iter()
+            .all(|modifier| modifier.id != "curios:scoped/head/0"));
     }
 
     #[test]

@@ -29,8 +29,9 @@ pub fn place_key(entity: u32, slot_type: u16, slot: u16) -> u64 {
     (u64::from(entity) << 32) | (u64::from(slot_type) << 16) | u64::from(slot)
 }
 
-/// Decodes `(entity, slot type, slot)` from a place key. The returned slot
-/// index has the [`COSMETIC_FLAG`] bit cleared; use [`is_cosmetic`] to test it.
+/// Decodes `(entity, slot type, slot)` from a place key. The returned slot is
+/// the raw low 16 bits, including [`COSMETIC_FLAG`]; use [`is_cosmetic`] to
+/// test the flag and `slot & SLOT_MASK` for the actual slot index.
 pub fn parse_key(key: u64) -> (u32, u16, u16) {
     (
         (key >> 32) as u32,
@@ -160,6 +161,14 @@ fn notify_change(
         &NetTag::Compound(Vec::new()),
     ) {
         eprintln!("[curios] stack sync failed for {}: {error:?}", slot_type.id());
+    }
+    // Agent #2's custom GUI only refreshes on its own actions; an equip from
+    // outside the menu needs the same state push (players only).
+    if !crate::menu::sync_state(host, uuid) {
+        eprintln!(
+            "[curios] menu state sync failed for slot {}",
+            slot_type.id()
+        );
     }
 }
 
@@ -400,6 +409,28 @@ mod tests {
         let key = place_key(42, 7, 3);
         assert_eq!(parse_key(key), (42, 7, 3));
         assert_eq!(place_key(0xffff_ffff, 0xffff, 0xffff), u64::MAX);
+    }
+
+    #[test]
+    fn place_key_boundaries_are_lossless() {
+        for entity in [0_u32, 1, u32::MAX] {
+            for type_index in [0_u16, 1, u16::MAX] {
+                for slot in [0_u16, 1, SLOT_MASK] {
+                    let plain = place_key(entity, type_index, slot);
+                    assert_eq!(parse_key(plain), (entity, type_index, slot));
+                    assert!(!is_cosmetic(plain));
+                    let cosmetic = place_key(entity, type_index, slot | COSMETIC_FLAG);
+                    assert_eq!(
+                        parse_key(cosmetic),
+                        (entity, type_index, slot | COSMETIC_FLAG)
+                    );
+                    assert!(is_cosmetic(cosmetic));
+                    assert_eq!(parse_key(cosmetic).2 & SLOT_MASK, slot);
+                }
+            }
+        }
+        assert!(curio_place(1, "ring", COSMETIC_FLAG).is_none());
+        assert!(cosmetic_place(1, "ring", SLOT_MASK + 1).is_none());
     }
 
     #[test]

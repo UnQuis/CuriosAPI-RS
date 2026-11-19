@@ -1,0 +1,122 @@
+//! Минимальный мод, показывающий публичный API CuriosAPI-RS.
+//!
+//! Скопируйте этот файл в `src/lib.rs` своего мода и добавьте зависимости из
+//! `examples/curio_example/README.md`. Файл намеренно не является отдельным
+//! Cargo-проектом: launcher Horizon должен видеть только один crate-мод.
+//!
+//! Адаптация интерфейсов TheIllusiveC4/Curios (LGPL-3.0-or-later,
+//! copyright 2018-2024 C4); см. COPYING и COPYING.LESSER.
+
+use std::sync::Arc;
+
+use mod_api::{Hooks, Registrar, RegistrationContext};
+use mod_curios::api::{self, CurioBehavior, CurioContext, DropRule, SlotResult, TriState};
+use mod_curios::events::{
+    self, CurioCanEquipEvent, CurioChangeEvent, CurioDropsEvent, DropRulesEvent,
+};
+use mod_curios::inventory::CurioInventory;
+
+const AMULET: &str = "mymod:amulet";
+
+/// Поведение предмета-курио. Все методы имеют разумные реализации по умолчанию;
+/// здесь переопределены только нужные.
+struct Amulet;
+
+impl CurioBehavior for Amulet {
+    /// Пустой список означает «любой тип слота».
+    fn supported_slots(&self) -> &[String] {
+        &[]
+    }
+
+    fn can_equip(&self, ctx: &CurioContext<'_>) -> bool {
+        // Амулет не надевается на стопы.
+        ctx.slot != "curios:feet"
+    }
+
+    fn can_unequip(&self, _ctx: &CurioContext<'_>) -> bool {
+        true
+    }
+
+    /// Амулет всегда остаётся у владельца при смерти.
+    fn drop_rule(&self) -> DropRule {
+        DropRule::AlwaysKeep
+    }
+
+    fn on_equip(&self, ctx: &CurioContext<'_>) {
+        eprintln!("[mymod] equipped {} in {} #{}", ctx.item, ctx.slot, ctx.index);
+    }
+
+    fn on_unequip(&self, ctx: &CurioContext<'_>) {
+        eprintln!("[mymod] unequipped {} from {}", ctx.item, ctx.slot);
+    }
+}
+
+#[derive(Default)]
+struct ExampleMod;
+
+#[mod_api::horizon_mod]
+impl Hooks for ExampleMod {
+    fn register(&self, _r: &mut dyn Registrar, _cx: &RegistrationContext) {
+        // 1. Регистрация предмета. Дубликат или неверный id отвергается явно.
+        if let Err(error) = api::register_curio(AMULET, Arc::new(Amulet)) {
+            eprintln!("[mymod] curio registration refused: {error}");
+        }
+
+        // 2. Слушатель canEquip: форсируем надевание нашего амулета.
+        if let Err(error) = events::register_can_equip(Arc::new(|event: &mut CurioCanEquipEvent| {
+            if event.item_id == AMULET {
+                event.result = TriState::True;
+            }
+            // event.resolve() даёт финальный ответ с учётом original.
+        })) {
+            eprintln!("[mymod] can_equip listener refused: {error}");
+        }
+
+        // 3. Слушатель изменения слота: логируем замену предмета.
+        if let Err(error) = events::register_change(Arc::new(|event: &mut CurioChangeEvent| {
+            if event.slot == "ring" {
+                eprintln!(
+                    "[mymod] ring #{} of entity {} changed",
+                    event.index, event.entity
+                );
+            }
+        })) {
+            eprintln!("[mymod] change listener refused: {error}");
+        }
+
+        // 4. Дропы: пустую пачку можно отменить целиком.
+        if let Err(error) = events::register_drops(Arc::new(|event: &mut CurioDropsEvent| {
+            if event.drops.is_empty() {
+                event.cancelled = true;
+            }
+        })) {
+            eprintln!("[mymod] drops listener refused: {error}");
+        }
+
+        // 5. Правила дропа по id предмета.
+        if let Err(error) = events::register_drop_rules(Arc::new(|event: &mut DropRulesEvent| {
+            event.add_override(AMULET, DropRule::AlwaysKeep);
+        })) {
+            eprintln!("[mymod] drop_rules listener refused: {error}");
+        }
+    }
+}
+
+/// Чтение инвентаря: `api::find_first` возвращает первый найденный предмет.
+/// Вызывайте из любого серверного хука, где у вас есть `&dyn Host`.
+#[allow(dead_code)]
+fn report_amulet(host: &mut dyn mod_api::ServerHost, holder: mod_api::Holder) {
+    let inventory: CurioInventory = match mod_curios::inventory::INVENTORY.get(host, holder) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            eprintln!("[mymod] could not read curio inventory: {error:?}");
+            return;
+        }
+    };
+    match api::find_first(&inventory, AMULET) {
+        Some(SlotResult { slot, index, .. }) => {
+            eprintln!("[mymod] amulet found in {slot} #{index}");
+        }
+        None => eprintln!("[mymod] no amulet equipped"),
+    }
+}
