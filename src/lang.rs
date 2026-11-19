@@ -9,7 +9,7 @@
 //! C4); see COPYING and COPYING.LESSER.
 
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 use mod_api::{ClientHost, Text};
 
@@ -97,32 +97,74 @@ pub fn lookup(locale: &str, key: &str) -> Option<&'static str> {
         })
 }
 
+/// Capitalised Java-style fallbacks, computed once per id. No per-frame
+/// allocation and no `Box::leak`: the cache owns every String it hands back.
+static CAPITALIZED: LazyLock<Mutex<BTreeMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn capitalized(id: &str) -> String {
+    let mut guard = CAPITALIZED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(value) = guard.get(id) {
+        return value.clone();
+    }
+    let mut chars = id.chars();
+    let value = match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    };
+    guard.insert(id.to_owned(), value.clone());
+    value
+}
+
 /// The translation for a slot identifier, e.g. `ring` → `Ring`.
 ///
 /// The Java fallback (see `CurioSlot.getSlotTooltip`) capitalises the id when
-/// no translation exists. The reference `en_us` has no `curios.identifier.feet`,
-/// so this is needed for a complete built-in slot list, not just a rare miss.
-pub fn slot_name(locale: &str, id: &str) -> Option<&'static str> {
-    if let Some(value) = lookup(locale, &format!("{KEY_IDENTIFIER_PREFIX}{id}")) {
-        return Some(value);
+/// no translation exists. Returns an owned String so the cached fallback can
+/// be reused without leaking.
+pub fn slot_name(locale: &str, id: &str) -> String {
+    match lookup(locale, &format!("{KEY_IDENTIFIER_PREFIX}{id}")) {
+        Some(value) => value.to_owned(),
+        None => capitalized(id),
     }
-    let mut chars = id.chars();
-    let capitalized: String = match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => return None,
-    };
-    Some(Box::leak(capitalized.into_boxed_str()))
 }
 
-/// The player's locale, resolved from the game's own translation of
-/// `container.inventory` (the pinned API has no locale helper). A Cyrillic
-/// answer selects `ru_ru`, anything else the English fallback.
+/// Normalises an applied language code to one of the shipped locale ids.
+fn normalize(code: &str) -> Option<&'static str> {
+    let key = code.replace('-', "_").to_ascii_lowercase();
+    if has_locale(&key) {
+        return LOCALES.iter().copied().find(|locale| *locale == key);
+    }
+    let base = key.split('_').next().unwrap_or("");
+    match base {
+        "en" => Some("en_us"),
+        "ru" => Some("ru_ru"),
+        "uk" => Some("uk_ua"),
+        "zh" => Some("zh_cn"),
+        "pt" => Some("pt_br"),
+        "ca" => Some("ca_es"),
+        "es" => Some("es_es"),
+        _ => None,
+    }
+}
+
+/// The player's applied language, from the client session service. The old
+/// Cyrillic probe was unreliable; a missing or unsupported language is an
+/// explicit fallback with a diagnostic, never a silent default.
 pub fn locale(host: &dyn ClientHost) -> &'static str {
-    let probe = host.translate("container.inventory").unwrap_or_default();
-    if probe.chars().any(|c| ('\u{0400}'..='\u{04ff}').contains(&c)) {
-        "ru_ru"
-    } else {
-        DEFAULT_LOCALE
+    match host.client_session().client_language() {
+        Some(code) => match normalize(&code) {
+            Some(locale) => locale,
+            None => {
+                eprintln!("[curios] language {code:?} is not shipped; using en_us");
+                DEFAULT_LOCALE
+            }
+        },
+        None => {
+            eprintln!("[curios] client language unavailable; using en_us");
+            DEFAULT_LOCALE
+        }
     }
 }
 
@@ -176,7 +218,8 @@ mod tests {
             "curio", "head", "necklace", "back", "body", "bracelet", "hands", "ring", "belt",
             "feet", "charm",
         ] {
-            assert!(slot_name(DEFAULT_LOCALE, id).is_some(), "no label for {id}");
+            let name = slot_name(DEFAULT_LOCALE, id);
+            assert!(!name.is_empty(), "no label for {id}");
         }
     }
 

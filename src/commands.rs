@@ -9,17 +9,18 @@
 //! 2018-2024 C4; see COPYING and COPYING.LESSER). `slots`, `reload`, `open` and
 //! `help` are port-specific additions kept as convenient aliases and diagnostics.
 //!
-//! Slot resizing goes through the attachment's own strict codec: the handler's
-//! four parallel lists are resized in a compound, decoded back and stored with
-//! `INVENTORY.set`. This keeps all mutations inside the server-owned attachment
-//! without requiring changes to `inventory.rs`.
+//! Slot resizing uses the handler's persistent `SlotSizeModifier` state plus
+//! `resize_to`, so a command-set count survives a data reload. Data-pack reload
+//! reads the declared `curios:slot_type` registry instead of the bundled defaults.
 
 use mod_api::{
-    Command, CommandArgumentValue, CommandInvocation, CommandSource, Compound, Flow, Holder,
+    Command, CommandArgumentValue, CommandInvocation, CommandSource, Flow, Holder,
     HostTransaction, ItemResource, PlayerRef, RegisterCommandsEvent, RunModCommandEvent,
-    ServerHost, Tag, Text,
+    ServerHost, Text,
 };
 
+use crate::attributes::{ModifierOperation, SlotSizeModifier};
+use crate::events::{self, SlotModifiersUpdatedEvent};
 use crate::inventory::INVENTORY;
 use crate::net;
 use crate::place;
@@ -276,9 +277,22 @@ fn resize(
     Ok(())
 }
 
-/// Resizes one handler through the attachment's own strict codec. The lists
-/// are kept parallel; removed stacks move to `invalid` so `server_tick` drops
-/// them exactly as it drops stacks invalidated by a data reload.
+/// The permanent `ADD_VALUE` modifier a command leaves on the slot handler.
+/// Its amount is the difference from the slot definition's base, so a data
+/// reload recomputes the same count instead of reverting it.
+fn command_modifier(base: u32, target: usize) -> (SlotSizeModifier, bool) {
+    (
+        SlotSizeModifier {
+            operation: ModifierOperation::AddValue,
+            amount: target as f64 - f64::from(base),
+        },
+        true, // permanent
+    )
+}
+
+/// Resizes one handler through its persistent modifiers, not by editing NBT
+/// lists. The modifier survives `INVENTORY.reload`; stacks that no longer fit
+/// are dropped immediately, server-side.
 fn resize_slot(
     host: &mut dyn ServerHost,
     uuid: u128,
@@ -289,81 +303,65 @@ fn resize_slot(
     if target > MAX_SLOTS {
         return Err(format!("slot count must be <= {MAX_SLOTS}"));
     }
-    let inventory = INVENTORY.get(host, *holder).map_err(|error| format!("{error:?}"))?;
-    let codec = INVENTORY
-        .codec
-        .as_ref()
-        .ok_or_else(|| "the inventory attachment has no codec".to_owned())?;
-    let mut root = (codec.encode)(&inventory).map_err(|error| format!("{error:?}"))?;
-    let (old, new) = resize_nbt(&mut root, slot_id, target)?;
-    let decoded = (codec.decode)(&root).map_err(|error| format!("{error:?}"))?;
-    INVENTORY
-        .set(host, *holder, decoded.clone())
-        .map_err(|error| format!("{error:?}"))?;
-    if let Err(error) = net::sync_inventory(host, uuid, &decoded) {
-        eprintln!("[curios] could not resync {uuid} after resize: {error:?}");
-    }
-    Ok((old, new))
-}
+    let entity_id = match holder {
+        Holder::Entity(id) => *id,
+        _ => return Err("curio slots are only held by entities".to_owned()),
+    };
+    let mut inventory = INVENTORY.get(host, *holder).map_err(|error| format!("{error:?}"))?;
+    let old = inventory
+        .slot(slot_id)
+        .ok_or_else(|| format!("unknown slot type {slot_id}"))?
+        .len();
+    let base = inventory
+        .slot(slot_id)
+        .ok_or_else(|| format!("unknown slot type {slot_id}"))?
+        .size_state()
+        .base;
+    let handler = inventory
+        .slot_mut(slot_id)
+        .ok_or_else(|| format!("unknown slot type {slot_id}"))?;
+    // Commands own the single permanent ADD_VALUE modifier (Java's `curios:command`
+    // id); other mods' modifiers are kept.
+    let mut modifiers: Vec<(SlotSizeModifier, bool)> = handler
+        .size_modifiers()
+        .iter()
+        .filter(|(modifier, permanent)| {
+            !(*permanent && modifier.operation == ModifierOperation::AddValue)
+        })
+        .cloned()
+        .collect();
+    modifiers.push(command_modifier(base, target));
+    handler.set_size_modifiers(modifiers);
+    let invalid = handler.resize_to(target);
 
-/// Pure NBT transformation used by [`resize_slot`]; tested without a host.
-fn resize_nbt(root: &mut Compound, slot_id: &str, target: usize) -> Result<(usize, usize), String> {
-    // `Compound` is a BTreeMap keyed by JavaString; inference from `get_mut`
-    // gives these locals that type without naming the runtime's string type.
-    let slots_key = "slots".into();
-    let slots = match root.get_mut(&slots_key) {
-        Some(Tag::Compound(slots)) => slots,
-        _ => return Err("saved inventory has no slots compound".to_owned()),
-    };
-    let handler_key = slot_id.into();
-    let handler = match slots.get_mut(&handler_key) {
-        Some(Tag::Compound(handler)) => handler,
-        _ => return Err(format!("slot {slot_id} is not in the inventory")),
-    };
-    let stacks_key = "stacks".into();
-    let old = match handler.get(&stacks_key) {
-        Some(Tag::List(list)) => list.len(),
-        _ => return Err("slot stacks are malformed".to_owned()),
-    };
-    let cosmetic_key = "cosmetic".into();
-    let cosmetic_exists = matches!(handler.get(&cosmetic_key), Some(Tag::List(_)));
-    let mut removed = Vec::new();
-    for (field, filler) in [
-        ("stacks", Tag::End),
-        ("cosmetic", Tag::End),
-        ("render", Tag::Byte(1)),
-        ("active", Tag::Byte(1)),
-    ] {
-        let field_key = field.into();
-        let Some(Tag::List(list)) = handler.get_mut(&field_key) else {
-            return Err(format!("slot field {field} is malformed"));
+    if !invalid.is_empty() {
+        let living = host.entity(entity_id).and_then(|entity| host.living(entity));
+        let Some(living) = living else {
+            return Err(format!("entity {entity_id} cannot drop overflow stacks"));
         };
-        // A slot without cosmetic slots keeps its empty cosmetic list.
-        let wanted = if field == "cosmetic" && !cosmetic_exists {
-            0
-        } else {
-            target
-        };
-        while list.len() > wanted {
-            let value = list.pop().ok_or_else(|| "list pop failed".to_owned())?;
-            if field == "stacks" || field == "cosmetic" {
-                if matches!(value, Tag::Compound(_)) {
-                    removed.push(value);
+        for snapshot in invalid {
+            match snapshot.to_stack(host) {
+                Ok(stack) => {
+                    if let Err(error) = living.drop(host, stack, true, false) {
+                        eprintln!("[curios] could not drop an overflow stack: {error:?}");
+                    }
                 }
+                Err(error) => eprintln!("[curios] overflow stack could not be decoded: {error:?}"),
             }
         }
-        while list.len() < wanted {
-            list.push(filler.clone());
-        }
     }
-    if !removed.is_empty() {
-        let invalid_key = "invalid".into();
-        let invalid = match root.get_mut(&invalid_key) {
-            Some(Tag::List(list)) => list,
-            _ => return Err("saved inventory has no invalid list".to_owned()),
-        };
-        invalid.extend(removed);
+
+    INVENTORY
+        .set(host, *holder, inventory.clone())
+        .map_err(|error| format!("{error:?}"))?;
+    if let Err(error) = net::sync_inventory(host, uuid, &inventory) {
+        eprintln!("[curios] could not resync {uuid} after resize: {error:?}");
     }
+    let mut event = SlotModifiersUpdatedEvent {
+        entity: entity_id,
+        slots: vec![slot_id.to_owned()],
+    };
+    events::dispatch_slot_modifiers_updated(&mut event);
     Ok((old, target))
 }
 
@@ -497,19 +495,39 @@ fn help_lines() -> Vec<Text> {
     ]
 }
 
-/// Rebuilds the slot registry from validated definitions, then migrates and
-/// resynchronises every online player. Invalid stacks are left for `server_tick`.
+/// Chooses the slot definitions for a manual reload. The declared datapack
+/// registry wins; bundled definitions are only a diagnostic fallback when the
+/// registry cannot be read (for example before the first level is available).
+fn reload_types(datapack: Result<Vec<SlotType>, String>, fallback: Result<Vec<SlotType>, String>) -> Result<Vec<SlotType>, String> {
+    match datapack {
+        Ok(types) => Ok(types),
+        Err(error) => {
+            eprintln!("[curios] datapack slot types unavailable ({error}); using bundled defaults");
+            fallback
+        }
+    }
+}
+
+/// Rebuilds the slot registry from the loaded datapack registry, migrates and
+/// resynchronises every online player, and drops stacks that no longer fit.
 pub fn reload(host: &mut dyn ServerHost) -> Result<(), String> {
-    let types = registry::builtin_slot_types().map_err(|error| format!("{error}"))?;
+    let types = reload_types(
+        crate::datapack::read_slot_types(host, crate::datapack::DEFAULT_DIMENSION)
+            .map_err(|error| format!("{error:?}")),
+        registry::builtin_slot_types().map_err(|error| format!("{error}")),
+    )?;
     let count = types.len();
     registry::replace_slot_types(types.clone()).map_err(|error| format!("{error}"))?;
 
     let players: Vec<_> = host.players().server_players().into_iter().collect();
     for player in players {
         let uuid = player.uuid();
-        let holder = Holder::Entity(player.entity().id());
+        let entity = player.entity();
+        let holder = Holder::Entity(entity.id());
         let mut inventory = INVENTORY.get(host, holder).map_err(|error| format!("{error:?}"))?;
-        let _invalid = inventory.reload(&types);
+        // `reload` adopts stacks that no longer fit into `inventory.invalid`;
+        // the ordinary server tick drops them from there instead of losing them.
+        inventory.reload(&types);
         INVENTORY
             .set(host, holder, inventory.clone())
             .map_err(|error| format!("{error:?}"))?;
@@ -522,7 +540,7 @@ pub fn reload(host: &mut dyn ServerHost) -> Result<(), String> {
     }
     feedback(
         host,
-        Text::literal(format!("§aCurios: reloaded §e{count}§a slot types.")),
+        Text::literal(format!("§aCurios: reloaded §e{count}§a slot types from data packs.")),
     );
     Ok(())
 }
@@ -548,13 +566,7 @@ pub fn open(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn inventory_nbt() -> Compound {
-        let types = registry::slot_types();
-        let inventory = crate::inventory::CurioInventory::from_slot_types(&types);
-        let codec = INVENTORY.codec.as_ref().expect("inventory has a codec");
-        (codec.encode)(&inventory).expect("encoding succeeds")
-    }
+    use crate::attributes::SlotSizeState;
 
     #[test]
     fn help_lists_every_java_subcommand() {
@@ -567,33 +579,41 @@ mod tests {
     }
 
     #[test]
-    fn resize_nbt_grows_and_shrinks_all_parallel_lists() {
-        let mut root = inventory_nbt();
-        let (old, new) = resize_nbt(&mut root, "ring", 5).unwrap();
-        let types = registry::slot_types();
-        let base = types.iter().find(|slot| slot.id() == "ring").unwrap().size() as usize;
-        assert_eq!(old, base);
-        assert_eq!(new, 5);
-        let codec = INVENTORY.codec.as_ref().unwrap();
-        let grown = (codec.decode)(&root).unwrap();
-        let handler = grown.slot("ring").unwrap();
-        assert_eq!(handler.len(), 5);
-        assert_eq!(handler.render(4), Some(true));
-        assert_eq!(handler.active(4), Some(true));
+    fn a_command_modifier_survives_reload_and_recomputes_the_size() {
+        let base = 1u32;
+        let state = SlotSizeState {
+            base,
+            modifiers: vec![command_modifier(base, 5)],
+        };
+        assert_eq!(state.resize().size, 5);
+        assert!(state.resize().changed);
 
-        let (old, new) = resize_nbt(&mut root, "ring", 2).unwrap();
-        assert_eq!((old, new), (5, 2));
-        let shrunk = (codec.decode)(&root).unwrap();
-        assert_eq!(shrunk.slot("ring").unwrap().len(), 2);
+        // The modifier is part of the strict attachment codec, so a serialized
+        // and decoded inventory still computes the same size.
+        let types = registry::slot_types();
+        let mut inventory = crate::inventory::CurioInventory::from_slot_types(&types);
+        inventory
+            .slot_mut("ring")
+            .expect("ring slot exists")
+            .set_size_modifiers(vec![command_modifier(base, 5)]);
+        let codec = INVENTORY.codec.as_ref().expect("inventory has a codec");
+        let encoded = (codec.encode)(&inventory).expect("encoding succeeds");
+        let decoded = (codec.decode)(&encoded).expect("decoding succeeds");
+        assert_eq!(
+            decoded.slot("ring").expect("ring survived").size_state().resize().size,
+            5
+        );
     }
 
     #[test]
-    fn resize_nbt_refuses_unknown_slot_and_malformed_roots() {
-        let mut root = inventory_nbt();
-        assert!(resize_nbt(&mut root, "missing", 3).is_err());
-        let mut empty = Compound::new();
-        assert!(resize_nbt(&mut empty, "ring", 3).is_err());
-        assert!(MAX_SLOTS > 0);
+    fn reload_prefers_datapack_slot_types_with_a_documented_fallback() {
+        let datapack = vec![SlotType::new("custom").unwrap()];
+        let bundled = vec![SlotType::new("ring").unwrap()];
+        let chosen = reload_types(Ok(datapack.clone()), Ok(bundled.clone())).unwrap();
+        assert_eq!(chosen[0].id(), "custom");
+        let fallback = reload_types(Err("no level".to_owned()), Ok(bundled.clone())).unwrap();
+        assert_eq!(fallback[0].id(), "ring");
+        assert!(reload_types(Err("no level".to_owned()), Err("bad json".to_owned())).is_err());
     }
 
     #[test]

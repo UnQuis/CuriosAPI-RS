@@ -107,6 +107,7 @@ fn notify_change(
     previous: Option<ItemSnapshot>,
     current: Option<ItemSnapshot>,
     kind: ChangeKind,
+    slot_count_changed: bool,
 ) {
     let previous_id = previous.as_ref().and_then(ItemSnapshot::item_id);
     let current_id = current.as_ref().and_then(ItemSnapshot::item_id);
@@ -138,10 +139,12 @@ fn notify_change(
         }
     }
 
-    events::dispatch_slot_modifiers_updated(&mut SlotModifiersUpdatedEvent {
-        entity,
-        slots: vec![slot_type.id().to_owned()],
-    });
+    if slot_count_changed {
+        events::dispatch_slot_modifiers_updated(&mut SlotModifiersUpdatedEvent {
+            entity,
+            slots: vec![slot_type.id().to_owned()],
+        });
+    }
 
     let Some(uuid) = player_uuid(host, entity) else {
         return;
@@ -177,6 +180,14 @@ fn snapshot_of(
     stack: Option<&mod_api::ItemStack>,
 ) -> Result<Option<ItemSnapshot>, InventoryError> {
     stack.map(|stack| ItemSnapshot::from_stack(host, stack)).transpose()
+}
+
+/// Current slot count for a place key, used to detect a real dynamic resize.
+fn slot_count(host: &mut dyn ServerHost, key: u64) -> Option<usize> {
+    let (entity, type_index, _) = parse_key(key);
+    let slot_type = registry::slot_type_at(type_index)?;
+    let inventory = INVENTORY.get(host, Holder::Entity(entity)).ok()?;
+    inventory.slot(slot_type.id()).map(|handler| handler.len())
 }
 
 /// Reads one stored stack through the host's canonical item ids.
@@ -250,8 +261,10 @@ impl PlaceProvider for CurioPlaceProvider {
             eprintln!("[curios] insert refused: place key {key} has no slot type");
             return 0;
         };
-        let item_id = resource.item().id(host);
-        if !equip::can_equip(&slot_type, &context, &item_id, TriState::Default) {
+        let before_count = slot_count(host, key);
+        let item = resource.item();
+        let item_id = item.id(host);
+        if !equip::can_equip_host(host, &slot_type, &context, item, &item_id, TriState::Default) {
             return 0;
         }
         let existing = match read_stack(host, key) {
@@ -271,7 +284,13 @@ impl PlaceProvider for CurioPlaceProvider {
                 return 0;
             }
         };
-        let limit = host.max_stack_size(resource.item()).unwrap_or(64);
+        let Some(limit) = host.max_stack_size(resource.item()) else {
+            eprintln!(
+                "[curios] insert refused: no stack size for item {}",
+                item_id
+            );
+            return 0;
+        };
         let current = existing.as_ref().map_or(0, mod_api::ItemStack::count);
         let room = limit.saturating_sub(current);
         let taken = amount.min(room);
@@ -298,6 +317,9 @@ impl PlaceProvider for CurioPlaceProvider {
         };
         match write_stack(host, key, Some(&next)) {
             Ok(()) => {
+                let after_count = slot_count(host, key);
+                let slot_count_changed =
+                    before_count.is_some_and(|before| after_count != Some(before));
                 notify_change(
                     host,
                     entity,
@@ -307,6 +329,7 @@ impl PlaceProvider for CurioPlaceProvider {
                     previous,
                     current,
                     kind,
+                    slot_count_changed,
                 );
                 taken
             }
@@ -329,6 +352,7 @@ impl PlaceProvider for CurioPlaceProvider {
             eprintln!("[curios] extract refused: place key {key} has no slot type");
             return 0;
         };
+        let before_count = slot_count(host, key);
         let Some(existing) = read_stack(host, key).unwrap_or_else(|error| {
             report(&error);
             None
@@ -380,6 +404,9 @@ impl PlaceProvider for CurioPlaceProvider {
         };
         match write_stack(host, key, next.as_ref()) {
             Ok(()) => {
+                let after_count = slot_count(host, key);
+                let slot_count_changed =
+                    before_count.is_some_and(|before| after_count != Some(before));
                 notify_change(
                     host,
                     entity,
@@ -389,6 +416,7 @@ impl PlaceProvider for CurioPlaceProvider {
                     Some(previous),
                     current,
                     kind,
+                    slot_count_changed,
                 );
                 took
             }

@@ -31,6 +31,8 @@ pub mod net;
 pub mod place;
 pub mod registry;
 pub mod render;
+#[cfg(test)]
+mod review_regressions;
 pub mod slots;
 
 /// Key that toggles rendering of the hovered Curio slot in the open menu.
@@ -167,6 +169,18 @@ impl Hooks for Curios {
     }
 
     /// Java `CuriosCommonEvents.handleDrops`: resolve drop rules on death.
+    /// Bring an offline player's inventory to the current slot layout when
+    /// they join (review #22: data-pack reload only migrates resident players).
+    fn player_logged_in(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {
+        let types = registry::slot_types();
+        if let Err(error) = inventory::migrate_offline(host, event.player, types.as_slice()) {
+            eprintln!(
+                "[curios] offline inventory migration failed for {}: {error:?}",
+                event.player
+            );
+        }
+    }
+
     fn data_pack_files(&self, _host: &mut dyn ServerHost, event: &mut DataPackFilesEvent<'_>) {
         datapack::data_pack_files(event);
     }
@@ -195,6 +209,9 @@ impl Hooks for Curios {
         let Some(entity) = host.entity(event.entity).and_then(|entity| host.living(entity)) else {
             return Flow::Continue;
         };
+        let game_rule = matches!(host.game_rule("keep_inventory"), Ok(GameRuleValue::Bool(true)));
+        let keep = config::keep_inventory(game_rule);
+        let mut drops = Vec::new();
         for slot in registry::slot_types().iter() {
             let Some(handler) = inventory.slot_mut(slot.id()) else {
                 continue;
@@ -216,19 +233,24 @@ impl Hooks for Curios {
                     &snapshot,
                     item_rule,
                     handler.drop_rule(),
+                    keep,
                     false,
                 );
-                let Some(removed) = handler.apply_drop(index, decision).unwrap_or(None) else {
-                    continue;
-                };
-                match removed.to_stack(host) {
-                    Ok(stack) => {
-                        if let Err(error) = entity.drop(host, stack, true, false) {
-                            eprintln!("[curios] death drop failed: {error:?}");
-                        }
-                    }
-                    Err(error) => eprintln!("[curios] death stack decode failed: {error:?}"),
+                // `apply_drop` only returns a stack for `DropOutcome::Drop`;
+                // `Destroy` items are cleared without spawning anything.
+                if let Some(removed) = handler.apply_drop(index, decision).unwrap_or(None) {
+                    drops.push(removed);
                 }
+            }
+        }
+        for snapshot in events::dispatch_death_drops(event.entity, drops) {
+            match snapshot.to_stack(host) {
+                Ok(stack) => {
+                    if let Err(error) = entity.drop(host, stack, true, false) {
+                        eprintln!("[curios] death drop failed: {error:?}");
+                    }
+                }
+                Err(error) => eprintln!("[curios] death stack decode failed: {error:?}"),
             }
         }
         if let Err(error) = inventory::INVENTORY.set(host, holder, inventory) {
@@ -250,20 +272,20 @@ impl Hooks for Curios {
     }
 
     fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent) {
-        let slot = usize::try_from(event.slot).unwrap_or(0);
-        menu::menu_clicked(host, event.uuid, event.window, slot);
+        // The GUI layer rejects negative slots and foreign windows itself.
+        menu::menu_clicked(host, event.uuid, event.window, event.slot);
     }
 
-    fn menu_closed(&self, _host: &mut dyn ServerHost, _event: &mut MenuClosedEvent) {
-        menu::menu_closed();
+    fn menu_closed(&self, _host: &mut dyn ServerHost, event: &mut MenuClosedEvent) {
+        menu::menu_closed(event.uuid);
     }
 
     fn screen_opening(
         &self,
-        _host: &dyn ClientHost,
+        host: &dyn ClientHost,
         event: &mut ScreenOpeningEvent<'_>,
     ) -> Option<ScreenOpening> {
-        menu::screen_opening(event.new);
+        menu::screen_opening(client_uuid(host), event.new);
         None
     }
 
@@ -272,36 +294,39 @@ impl Hooks for Curios {
         host: &dyn ClientHost,
         event: &mut ScreenRenderBackgroundEvent<'_>,
     ) {
-        menu::screen_render_background(host, event);
+        menu::screen_render_background(client_uuid(host), host, event);
     }
 
     fn screen_render_post(&self, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
-        menu::screen_render_post(host, event);
+        menu::screen_render_post(client_uuid(host), host, event);
     }
 
     fn screen_mouse_button_pressed_pre(
         &self,
-        _host: &dyn ClientHost,
+        host: &dyn ClientHost,
         event: &mut ScreenMouseButtonPressedPreEvent<'_>,
     ) -> Flow {
-        menu::screen_mouse_button_pressed_pre(event.screen, event.button)
+        menu::screen_mouse_button_pressed_pre(client_uuid(host), event.screen, event.button)
     }
 
     fn screen_mouse_scrolled_pre(
         &self,
-        _host: &dyn ClientHost,
+        host: &dyn ClientHost,
         event: &mut ScreenMouseScrolledPreEvent<'_>,
     ) -> Flow {
-        menu::screen_mouse_scrolled_pre(event.screen, event.scroll)
+        menu::screen_mouse_scrolled_pre(client_uuid(host), event.screen, event.scroll)
     }
 
     fn key_mapping_pre(&self, host: &mut dyn ClientHost, event: &mut KeyMappingPreEvent<'_>) -> Flow {
+        // Screen hooks only have `&dyn ClientHost`; button actions are queued
+        // there and sent from this mutable hook.
+        input::flush_pending_actions(host);
         if input::on_mapping_press(host, event.mapping, event.pressed) {
             return Flow::Cancel;
         }
         if event.pressed {
             let handled = match event.mapping {
-                RENDER_KEY_ID => menu::hovered_render_slot()
+                RENDER_KEY_ID => menu::hovered_render_slot(client_uuid(host))
                     .is_some_and(|slot| input::send_render_toggle(host, slot)),
                 PAGE_NEXT_KEY => input::send_page(host, true),
                 PAGE_PREV_KEY => input::send_page(host, false),
@@ -322,4 +347,9 @@ impl Hooks for Curios {
     ) -> Flow {
         render::render_living(host, event)
     }
+}
+
+/// Local player id for client screen hooks, which have no event field for it.
+fn client_uuid(host: &dyn ClientHost) -> u128 {
+    host.local_player().map_or(0, |player| player.uuid())
 }

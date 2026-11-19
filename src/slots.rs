@@ -159,13 +159,41 @@ impl fmt::Display for InvalidSlotId {
 
 impl Error for InvalidSlotId {}
 
-/// Validates a slot id, which the Java `tag` predicate embeds into
+/// Validates a bare slot id, which the Java `tag` predicate embeds into
 /// `curios:<id>` via `Identifier.fromNamespaceAndPath`.
 pub fn validate_slot_id(id: &str) -> Result<(), InvalidSlotId> {
     if id.contains(':') || !valid_path(id) {
         Err(InvalidSlotId(id.to_owned()))
     } else {
         Ok(())
+    }
+}
+
+/// Parses a bare or namespaced slot id into `(namespace, bare id)`.
+///
+/// Bare ids belong to `curios` (the bundled slot namespace); data-pack entries
+/// such as `mymod:ring` keep their own namespace so they cannot collide with
+/// a bundled slot of the same bare id (review #20).
+pub fn parse_qualified_slot_id(id: &str) -> Result<(String, String), InvalidSlotId> {
+    match id.split_once(':') {
+        Some((namespace, path)) => {
+            if !valid_namespace(namespace) || !valid_path(path) {
+                return Err(InvalidSlotId(id.to_owned()));
+            }
+            Ok((namespace.to_owned(), path.to_owned()))
+        }
+        None => {
+            validate_slot_id(id)?;
+            Ok(("curios".to_owned(), id.to_owned()))
+        }
+    }
+}
+
+/// Normalises a bare or namespaced slot id to its canonical `namespace:id` form.
+pub fn qualify_slot_id(id: &str) -> String {
+    match parse_qualified_slot_id(id) {
+        Ok((namespace, path)) => format!("{namespace}:{path}"),
+        Err(_) => id.to_owned(),
     }
 }
 
@@ -252,6 +280,8 @@ pub enum SlotError {
     InvalidOperation(String),
     /// A reload produced no slot definitions at all.
     EmptyRegistry,
+    /// Two entries resolved to the same canonical `namespace:id`.
+    DuplicateSlotId(String),
     /// The process-wide registry was already initialised and cannot be replaced.
     RegistryAlreadyInitialised,
 }
@@ -269,6 +299,7 @@ impl fmt::Display for SlotError {
                 "unknown slot size operation `{op}` (expected set, add or remove)"
             ),
             Self::EmptyRegistry => f.write_str("slot registry cannot be empty"),
+            Self::DuplicateSlotId(id) => write!(f, "duplicate slot id `{id}`"),
             Self::RegistryAlreadyInitialised => {
                 f.write_str("slot registry was already initialised")
             }
@@ -285,6 +316,7 @@ impl Error for SlotError {
             Self::InvalidDropRule(err) => Some(err),
             Self::InvalidSize(_)
             | Self::InvalidOperation(_)
+            | Self::DuplicateSlotId(_)
             | Self::EmptyRegistry
             | Self::RegistryAlreadyInitialised => None,
         }
@@ -362,6 +394,7 @@ impl SlotDefinition {
 #[derive(Clone, Debug)]
 pub struct SlotType {
     id: String,
+    namespace: String,
     order: i32,
     size: i32,
     use_native_gui: bool,
@@ -376,9 +409,11 @@ pub struct SlotType {
 impl SlotType {
     /// Creates a slot with the Java `SlotType.Builder#build` defaults.
     pub fn new(id: &str) -> Result<Self, SlotError> {
-        validate_slot_id(id)?;
+        let (namespace, bare) = parse_qualified_slot_id(id)?;
+        let _ = validate_slot_id(&bare);
         Ok(Self {
-            id: id.to_owned(),
+            id: bare,
+            namespace,
             order: DEFAULT_ORDER,
             size: DEFAULT_SIZE,
             use_native_gui: true,
@@ -446,9 +481,19 @@ impl SlotType {
         Self::from_definition(id, &SlotDefinition::from_json(json)?)
     }
 
-    /// Unique slot id used for ordering ties and the `curios:<id>` tag.
+    /// Bare slot id (`ring`), unchanged from the Java `ISlotType#getId`.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Namespace of the slot definition (`curios` for bundled slots).
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Canonical `namespace:id` (`curios:ring`, `mymod:ring`).
+    pub fn qualified_id(&self) -> String {
+        format!("{}:{}", self.namespace, self.id)
     }
 
     /// Ascending display priority; lower values come first.
@@ -535,9 +580,11 @@ impl SlotType {
 
 impl Ord for SlotType {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.order
-            .cmp(&other.order)
-            .then_with(|| self.id.cmp(&other.id))
+        self.order.cmp(&other.order).then_with(|| {
+            self.namespace
+                .cmp(&other.namespace)
+                .then_with(|| self.id.cmp(&other.id))
+        })
     }
 }
 
@@ -789,6 +836,23 @@ mod tests {
         assert!(slots[1] < slots[2]);
         assert_eq!(slots[1], SlotType::new("a").unwrap().with_order(10));
         assert_eq!(slots[1].cmp(&slots[1]), Ordering::Equal);
+    }
+
+    #[test]
+    fn qualified_slot_ids_keep_namespaces_separate() {
+        let bundled = SlotType::new("ring").unwrap();
+        assert_eq!(bundled.id(), "ring");
+        assert_eq!(bundled.namespace(), "curios");
+        assert_eq!(bundled.qualified_id(), "curios:ring");
+
+        let external = SlotType::new("mymod:ring").unwrap();
+        assert_eq!(external.id(), "ring");
+        assert_eq!(external.namespace(), "mymod");
+        assert_eq!(external.qualified_id(), "mymod:ring");
+        assert_ne!(bundled, external);
+        assert_eq!(qualify_slot_id("ring"), "curios:ring");
+        assert_eq!(qualify_slot_id("mymod:ring"), "mymod:ring");
+        assert!(parse_qualified_slot_id("Bad:ID").is_err());
     }
 
     #[test]

@@ -24,7 +24,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mod_api::{
-    DataPackFilesEvent, DatapackField, DatapackFieldKind, DatapackReadError,
+    AttachmentQueriesMut, DataPackFilesEvent, DatapackField, DatapackFieldKind, DatapackReadError,
     DatapackRegistrationError, DatapackRegistrySync, DatapackValue, Holder, Host, Registrar,
     ServerHost, ServerTickEvent,
 };
@@ -292,7 +292,9 @@ pub fn definition_from_fields(
     values: Vec<(String, DatapackValue)>,
 ) -> Result<(String, SlotDefinition), ReloadError> {
     let fields: HashMap<String, DatapackValue> = values.into_iter().collect();
-    let id = entry.split_once(':').map_or(entry, |(_, path)| path).to_owned();
+    // Keep the full `namespace:id`: `curios:ring` and `mymod:ring` must stay
+    // distinct registry entries (review #20).
+    let id = entry.to_owned();
     let rule = text_field(&fields, "drop_rule")?;
     let drop_rule = rule
         .parse::<DropRule>()
@@ -341,44 +343,87 @@ pub fn read_slot_types(
     Ok(decoded.into_values().collect())
 }
 
-/// Applies a rebuilt registry and migrates every online player's inventory.
+/// Migrates every resident inventory row (players and mobs), including rows
+/// whose owner is offline for the current dimension snapshot (review #22).
+fn migrate_resident_inventories(host: &mut dyn ServerHost, types: &[SlotType]) {
+    let Ok(batch) = host.query_mut(&inventory::INVENTORY) else {
+        eprintln!("[curios] could not snapshot inventory attachments for migration");
+        return;
+    };
+    for row in batch.iter() {
+        let Ok(row) = row else {
+            eprintln!("[curios] could not decode an inventory row during migration");
+            continue;
+        };
+        let mut inventory = row.value().clone();
+        let before = inventory.invalid_stacks().len();
+        inventory.reload(types);
+        if inventory.invalid_stacks().len() > before {
+            eprintln!(
+                "[curios] {} item(s) no longer fit after a slot reload",
+                inventory.invalid_stacks().len() - before
+            );
+        }
+        if let Err(error) = row.set(host, inventory) {
+            eprintln!("[curios] could not save migrated inventory: {error:?}");
+        }
+    }
+}
+
+/// Applies a rebuilt registry and migrates every resident inventory, then
+/// resynchronises the online players.
 fn apply(types: Vec<SlotType>, host: &mut dyn ServerHost) {
     if let Err(error) = registry::replace_slot_types(types.clone()) {
         eprintln!("[curios] slot registry reload refused: {error}");
         return;
     }
+    migrate_resident_inventories(host, &types);
     for player in host.players().server_players() {
-        let entity = player.entity();
-        let holder = Holder::Entity(entity.id());
-        let Ok(mut inventory) = inventory::INVENTORY.get(host, holder) else {
+        let uuid = player.uuid();
+        let holder = Holder::Entity(player.entity().id());
+        let Ok(inventory) = inventory::INVENTORY.get(host, holder) else {
             eprintln!("[curios] could not read inventory during slot reload");
             continue;
         };
-        let invalid = inventory.reload(&types);
-        if !invalid.is_empty() {
-            eprintln!(
-                "[curios] {} item(s) no longer fit after a slot reload",
-                invalid.len()
-            );
+        if let Err(error) = crate::net::sync_inventory(host, uuid, &inventory) {
+            eprintln!("[curios] could not resync {uuid} after reload: {error:?}");
         }
-        if let Err(error) = inventory::INVENTORY.set(host, holder, inventory) {
-            eprintln!("[curios] could not save inventory after slot reload: {error:?}");
+        if let Err(error) = crate::net::sync_data(host, uuid, &types) {
+            eprintln!("[curios] could not resync slot data to {uuid}: {error:?}");
         }
     }
+}
+
+/// Dimension name of the server's first loaded level, used for registry reads.
+pub fn server_dimension(host: &dyn ServerHost) -> Option<String> {
+    host.levels()
+        .list_levels()
+        .into_iter()
+        .next()?
+        .dimension()
+        .id(host)
 }
 
 /// Deferred reload reaction called from `Hooks::server_tick`.
 ///
 /// Does nothing unless [`mark_pending`] was called by `data_pack_files` or a
-/// reload hook. `CurioInventory::reload` handles migration; the existing
-/// server tick drops stacks reported as invalid.
+/// reload hook. The dimension comes from the live server; a failed read keeps
+/// the pending flag so the next tick retries instead of losing the reload.
 pub fn reload(host: &mut dyn ServerHost, _event: &mut ServerTickEvent<'_>) {
     if !take_pending() {
         return;
     }
-    match read_slot_types(host, DEFAULT_DIMENSION) {
+    let Some(dimension) = server_dimension(host) else {
+        mark_pending();
+        eprintln!("[curios] slot datapack reload deferred: no level dimension is available");
+        return;
+    };
+    match read_slot_types(host, &dimension) {
         Ok(types) => apply(types, host),
-        Err(error) => eprintln!("[curios] slot datapack reload failed: {error}"),
+        Err(error) => {
+            mark_pending();
+            eprintln!("[curios] slot datapack reload failed, retrying next tick: {error}");
+        }
     }
 }
 
@@ -528,8 +573,10 @@ mod tests {
             ),
         ];
         let (id, definition) = definition_from_fields("curios:ring", values).unwrap();
-        assert_eq!(id, "ring");
+        assert_eq!(id, "curios:ring");
         let slot = SlotType::from_definition(&id, &definition).unwrap();
+        assert_eq!(slot.id(), "ring");
+        assert_eq!(slot.qualified_id(), "curios:ring");
         assert_eq!(slot.order(), 160);
         assert_eq!(slot.size(), 2);
         assert_eq!(slot.icon().to_string(), "curios:slot/empty_ring_slot");
@@ -568,8 +615,9 @@ mod tests {
             let values = values_from_flat_json(json).unwrap();
             let (decoded_id, definition) =
                 definition_from_fields(&format!("curios:{id}"), values).unwrap();
-            assert_eq!(decoded_id, *id);
+            assert_eq!(decoded_id, format!("curios:{id}"));
             let slot = SlotType::from_definition(&decoded_id, &definition).unwrap();
+            assert_eq!(slot.id(), *id);
             let expected = builtins
                 .iter()
                 .find(|builtin| builtin.id() == *id)
@@ -581,6 +629,22 @@ mod tests {
             assert_eq!(slot.validators(), expected.validators(), "slot {id}");
             assert_eq!(&slot, expected, "slot {id}");
         }
+    }
+
+    #[test]
+    fn namespaced_entries_do_not_collide() {
+        let values =
+            values_from_flat_json(include_str!("../data/curios/curios/slot_type/ring.json"))
+                .unwrap();
+        let (curios_id, curios_def) = definition_from_fields("curios:ring", values.clone()).unwrap();
+        let (mymod_id, mymod_def) = definition_from_fields("mymod:ring", values).unwrap();
+        assert_eq!(curios_id, "curios:ring");
+        assert_eq!(mymod_id, "mymod:ring");
+        let bundled = SlotType::from_definition(&curios_id, &curios_def).unwrap();
+        let external = SlotType::from_definition(&mymod_id, &mymod_def).unwrap();
+        assert_eq!(bundled.id(), external.id());
+        assert_ne!(bundled.qualified_id(), external.qualified_id());
+        assert_ne!(bundled, external);
     }
 
     #[test]

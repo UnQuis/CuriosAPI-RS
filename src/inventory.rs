@@ -12,9 +12,14 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use mod_api::{AttachmentCodec, AttachmentError, AttachmentType, Compound, Host, ItemStack, Tag};
+use mod_api::{
+    AttachmentCodec, AttachmentError, AttachmentType, Compound, Holder, Host, ItemStack, ServerHost,
+    Tag,
+};
 
-use crate::attributes::{SlotSizeModifier, SlotSizeState, parse_modifier_operation};
+use crate::attributes::{
+    MAX_MODIFIER_AMOUNT, SlotSizeModifier, SlotSizeState, parse_modifier_operation,
+};
 use crate::drop::{DropRule, DropRules, ItemPredicate, decide_drop};
 use crate::registry;
 use crate::slots::{SlotType, validate_slot_id};
@@ -108,7 +113,9 @@ impl SlotStacks {
     /// Rebuilds all four parallel vectors to `target`, copying what fits from
     /// `old` and returning stacks that no longer fit as invalid.
     fn adopt_from(&mut self, old: &Self, target: usize) -> Vec<ItemSnapshot> {
-        let has_cosmetic = !self.cosmetic.is_empty() || !old.cosmetic.is_empty();
+        // Cosmetic support comes from the NEW slot definition, not the old
+        // handler; otherwise disabling `add_cosmetic` resurrects old stacks.
+        let has_cosmetic = !self.cosmetic.is_empty();
         self.stacks = (0..target)
             .map(|index| old.stacks.get(index).cloned().flatten())
             .collect();
@@ -132,10 +139,16 @@ impl SlotStacks {
                 invalid.push(item);
             }
         }
-        for index in target..old.cosmetic.len() {
-            if let Some(item) = old.cosmetic[index].clone() {
-                invalid.push(item);
+        if has_cosmetic {
+            for index in target..old.cosmetic.len() {
+                if let Some(item) = old.cosmetic[index].clone() {
+                    invalid.push(item);
+                }
             }
+        } else {
+            // Disabling `add_cosmetic` must not resurrect old cosmetic stacks
+            // or silently discard them (review #21).
+            invalid.extend(old.cosmetic.iter().flatten().cloned());
         }
         invalid
     }
@@ -258,10 +271,16 @@ impl SlotStacks {
         decision: crate::drop::DropDecision,
     ) -> Result<Option<ItemSnapshot>, InventoryError> {
         self.check_index(false, index)?;
-        if decision.outcome == crate::drop::DropOutcome::Keep {
-            return Ok(None);
+        match decision.outcome {
+            crate::drop::DropOutcome::Keep => Ok(None),
+            crate::drop::DropOutcome::Drop => Ok(self.stacks[index].take()),
+            // Destroy clears the slot but must never be spawned as a drop
+            // entity (review #5).
+            crate::drop::DropOutcome::Destroy => {
+                self.stacks[index].take();
+                Ok(None)
+            }
         }
-        Ok(self.stacks[index].take())
     }
 
     /// Resolves a drop rule for one stored item with the given overrides.
@@ -309,8 +328,16 @@ impl CurioInventory {
         }
     }
 
-    /// Rebuilds handlers after a data reload, carrying flags and valid stacks
-    /// and returning everything that no longer fits as invalid items.
+    /// Keeps stacks rejected by a reload inside the inventory so the ordinary
+    /// server tick can drop them instead of losing them (review #3).
+    pub fn adopt_invalid(&mut self, invalid: Vec<ItemSnapshot>) {
+        self.invalid.extend(invalid);
+    }
+
+    /// Rebuilds handlers after a data reload, carrying flags and valid stacks.
+    /// Returns the invalid stacks for callers that want to drop them directly;
+    /// the same stacks are also adopted into `self.invalid` so a caller that
+    /// only persists the inventory cannot lose items (review #3).
     pub fn reload(&mut self, types: &[SlotType]) -> Vec<ItemSnapshot> {
         let fresh = Self::from_slot_types(types);
         let mut invalid = Vec::new();
@@ -338,8 +365,9 @@ impl CurioInventory {
             invalid.extend(old.cosmetic.iter().flatten().cloned());
         }
         self.slots = rebuilt;
-        invalid.extend(std::mem::take(&mut self.invalid));
-        invalid
+        let rejected = invalid.clone();
+        self.adopt_invalid(invalid);
+        rejected
     }
 
     /// Handler for one slot type.
@@ -376,6 +404,24 @@ impl CurioInventory {
     pub fn take_invalid(&mut self) -> Vec<ItemSnapshot> {
         std::mem::take(&mut self.invalid)
     }
+}
+
+/// Migrates a saved but currently unloaded player's inventory on login.
+///
+/// Horizon cannot enumerate offline attachment rows, so the join hook must
+/// call this with the player's uuid (review #22).
+pub fn migrate_offline(
+    host: &mut dyn ServerHost,
+    uuid: u128,
+    types: &[SlotType],
+) -> Result<(), InventoryError> {
+    let holder = Holder::Player(uuid);
+    let Some(mut inventory) = INVENTORY.get_existing(host.attachments(), holder)? else {
+        return Ok(());
+    };
+    inventory.reload(types);
+    INVENTORY.set(host.attachments(), holder, inventory)?;
+    Ok(())
 }
 
 /// Errors from inventory operations. Nothing is silently defaulted.
@@ -472,6 +518,11 @@ fn decode_modifiers(value: Option<&Tag>) -> Result<Vec<(SlotSizeModifier, bool)>
             else {
                 return Err(AttachmentError::Decode);
             };
+            let amount = f64::from_bits(*bits);
+            if !amount.is_finite() || amount.abs() > MAX_MODIFIER_AMOUNT {
+                eprintln!("[curios] slot modifier amount {amount} is out of range");
+                return Err(AttachmentError::Decode);
+            }
             let Tag::Byte(permanent) =
                 map.get(&"permanent".into()).ok_or(AttachmentError::Decode)?
             else {
@@ -483,7 +534,7 @@ fn decode_modifiers(value: Option<&Tag>) -> Result<Vec<(SlotSizeModifier, bool)>
             Ok((
                 SlotSizeModifier {
                     operation,
-                    amount: f64::from_bits(*bits),
+                    amount,
                 },
                 *permanent == 1,
             ))
@@ -700,6 +751,22 @@ mod tests {
             }
         }
         assert_eq!(decode_inventory(&broken), Err(AttachmentError::Decode));
+
+        // A finite but absurd amount is refused before any allocation.
+        let mut absurd = encode_inventory(&CurioInventory::from_slot_types(&[slot()])).unwrap();
+        if let Some(Tag::Compound(slots)) = absurd.get_mut(&"slots".into()) {
+            if let Some(Tag::Compound(handler)) = slots.get_mut(&"ring".into()) {
+                handler.insert(
+                    "modifiers".into(),
+                    Tag::List(vec![Tag::compound([
+                        ("operation", Tag::String("add_value".into())),
+                        ("amount", Tag::Double(1.0e30_f64.to_bits())),
+                        ("permanent", Tag::Byte(1)),
+                    ])]),
+                );
+            }
+        }
+        assert_eq!(decode_inventory(&absurd), Err(AttachmentError::Decode));
     }
 
     #[test]
@@ -741,6 +808,54 @@ mod tests {
     }
 
     #[test]
+    fn apply_drop_only_returns_dropped_items() {
+        use crate::drop::{DropDecision, DropOutcome};
+
+        let item = snapshot("minecraft:stone");
+        let mut kept = SlotStacks::new(&slot());
+        kept.set_stack(0, Some(item.clone())).unwrap();
+        assert_eq!(
+            kept.apply_drop(
+                0,
+                DropDecision {
+                    rule: crate::drop::DropRule::AlwaysKeep,
+                    outcome: DropOutcome::Keep
+                }
+            ),
+            Ok(None)
+        );
+        assert_eq!(kept.stack(0), Some(&Some(item.clone())));
+
+        let mut dropped = SlotStacks::new(&slot());
+        dropped.set_stack(0, Some(item.clone())).unwrap();
+        assert_eq!(
+            dropped.apply_drop(
+                0,
+                DropDecision {
+                    rule: crate::drop::DropRule::AlwaysDrop,
+                    outcome: DropOutcome::Drop
+                }
+            ),
+            Ok(Some(item.clone()))
+        );
+        assert_eq!(dropped.stack(0), Some(&None));
+
+        let mut destroyed = SlotStacks::new(&slot());
+        destroyed.set_stack(0, Some(item.clone())).unwrap();
+        assert_eq!(
+            destroyed.apply_drop(
+                0,
+                DropDecision {
+                    rule: crate::drop::DropRule::Destroy,
+                    outcome: DropOutcome::Destroy
+                }
+            ),
+            Ok(None)
+        );
+        assert_eq!(destroyed.stack(0), Some(&None));
+    }
+
+    #[test]
     fn slot_size_modifiers_round_trip_and_apply_on_reload() {
         use crate::attributes::ModifierOperation;
 
@@ -763,14 +878,34 @@ mod tests {
 
         let types = [slot()];
         let mut reloaded = decoded;
-        let invalid = reloaded.reload(&types);
-        assert!(invalid.is_empty());
+        reloaded.reload(&types);
+        assert!(reloaded.invalid_stacks().is_empty());
         assert_eq!(reloaded.slot("ring").unwrap().len(), 4);
         assert_eq!(reloaded.slot("ring").unwrap().size_modifiers().len(), 1);
         assert_eq!(
             reloaded.slot("ring").unwrap().stack(1),
             Some(&Some(snapshot("minecraft:stone")))
         );
+    }
+
+    #[test]
+    fn disabling_cosmetics_marks_old_cosmetic_stacks_invalid() {
+        use crate::slots::SlotDefinition;
+
+        let definition = SlotDefinition::from_json(r#"{"size":2,"add_cosmetic":true}"#).unwrap();
+        let old_slot = SlotType::from_definition("ring", &definition).unwrap();
+        let mut inventory = CurioInventory::from_slot_types(&[old_slot]);
+        let item = snapshot("minecraft:stone");
+        inventory
+            .slot_mut("ring")
+            .unwrap()
+            .set_cosmetic(0, Some(item.clone()))
+            .unwrap();
+
+        let new_slot = SlotType::new("ring").unwrap().with_size(2);
+        inventory.reload(&[new_slot]);
+        assert_eq!(inventory.invalid_stacks(), &[item]);
+        assert!(inventory.slot("ring").unwrap().cosmetic(0).is_none());
     }
 
     #[test]

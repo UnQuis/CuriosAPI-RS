@@ -25,6 +25,14 @@ use crate::slots::{IntRange, SlotType, SlotTypePredicate};
 /// Data component that gates Curio attribute modifiers on an item stack.
 pub const ATTRIBUTE_COMPONENT_ID: &str = "curios:attribute_modifiers";
 
+/// Hard upper bound for a resolved slot count. Java has no cap, but a hostile
+/// or malformed modifier must never make the inventory allocate billions of
+/// slots (review #6).
+pub const MAX_SLOT_COUNT: i32 = 128;
+
+/// Largest accepted absolute modifier amount in a decoded NBT record.
+pub const MAX_MODIFIER_AMOUNT: f64 = 1.0e6;
+
 /// Adds the Curio component id to a `component_types` collection event once.
 pub fn register_component_types(event: &mut ComponentTypesEvent<'_>) {
     if !event.types.iter().any(|id| id == ATTRIBUTE_COMPONENT_ID) {
@@ -296,7 +304,7 @@ impl CurioAttributeModifiers {
                 entry
                     .slot
                     .as_ref()
-                    .is_none_or(|filter| filter.ids.is_empty() || filter.ids.iter().any(|id| id == slot_id))
+                    .is_none_or(|filter| filter.ids.iter().all(|id| id == slot_id))
             })
             .map(|entry| {
                 ResolvedModifier::new(
@@ -506,7 +514,9 @@ impl SlotSizeState {
             }
         }
         let size = if size.is_finite() && size > 0.0 {
-            size as u32
+            // Clamp before the cast: f64 -> u32 saturates to u32::MAX, which
+            // would try to allocate billions of slot entries on reload.
+            (size.min(f64::from(MAX_SLOT_COUNT))) as u32
         } else {
             0
         };
@@ -702,6 +712,32 @@ mod tests {
         assert_eq!(cleared.modifiers.len(), 2);
         // base 2 + 3 (ADD_VALUE), then * 2 (ADD_MULTIPLIED_TOTAL) = 10.
         assert_eq!(cleared.resize().size, 10);
+    }
+
+    #[test]
+    fn extreme_modifier_amounts_are_capped_not_saturating() {
+        let state = SlotSizeState {
+            base: 2,
+            modifiers: vec![(
+                SlotSizeModifier {
+                    operation: ModifierOperation::AddValue,
+                    amount: 1.0e30,
+                },
+                true,
+            )],
+        };
+        assert_eq!(state.resize().size, u32::try_from(MAX_SLOT_COUNT).unwrap());
+        let negative = SlotSizeState {
+            base: 2,
+            modifiers: vec![(
+                SlotSizeModifier {
+                    operation: ModifierOperation::AddValue,
+                    amount: -1.0e30,
+                },
+                false,
+            )],
+        };
+        assert_eq!(negative.resize().size, 0);
     }
 
     #[test]

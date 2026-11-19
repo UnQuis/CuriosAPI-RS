@@ -47,6 +47,25 @@ impl KeepCurios {
     pub fn drops_on_death(self) -> bool {
         matches!(self, Self::Off)
     }
+
+    /// `default` follows the game rule; `on`/`off` force the outcome.
+    pub fn keeps_inventory(self, game_rule: bool) -> bool {
+        match self {
+            Self::On => true,
+            Self::Off => false,
+            Self::Default => game_rule,
+        }
+    }
+}
+
+/// Pure form of the keep-inventory decision, for config and gameplay tests.
+pub fn keep_inventory_for(setting: KeepCurios, game_rule: bool) -> bool {
+    setting.keeps_inventory(game_rule)
+}
+
+/// Applies the configured `keep_curios` mode to the current game rule.
+pub fn keep_inventory(game_rule: bool) -> bool {
+    keep_inventory_for(current().server.keep_curios, game_rule)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -402,8 +421,13 @@ mod tests {
         );
         assert!(parse_server("keep_curios = ON").is_err());
         assert!(KeepCurios::Off.drops_on_death());
-        assert!(!KeepCurios::Default.drops_on_death());
         assert!(!KeepCurios::On.drops_on_death());
+        // `default` no longer has a fixed drop behaviour: it follows the game
+        // rule through `keeps_inventory` (review #4).
+        assert!(keep_inventory_for(KeepCurios::On, false));
+        assert!(!keep_inventory_for(KeepCurios::Off, true));
+        assert!(keep_inventory_for(KeepCurios::Default, true));
+        assert!(!keep_inventory_for(KeepCurios::Default, false));
     }
 
     #[test]

@@ -10,7 +10,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::config;
-use crate::slots::{SlotDefinition, SlotError, SlotType};
+use crate::slots::{SlotDefinition, SlotError, SlotType, qualify_slot_id};
 
 /// `(id, JSON)` pairs from `data/curios/curios/slots/` in Java declaration order.
 pub const BUILTIN: [(&str, &str); 11] = [
@@ -75,6 +75,12 @@ pub fn replace_slot_types(types: Vec<SlotType>) -> Result<(), SlotError> {
     if types.is_empty() {
         return Err(SlotError::EmptyRegistry);
     }
+    let mut seen = std::collections::BTreeSet::new();
+    for slot in &types {
+        if !seen.insert(slot.qualified_id()) {
+            return Err(SlotError::DuplicateSlotId(slot.qualified_id()));
+        }
+    }
     let mut guard = SLOT_TYPES
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -83,11 +89,24 @@ pub fn replace_slot_types(types: Vec<SlotType>) -> Result<(), SlotError> {
 }
 
 /// Index of a slot type in the deterministic registry order.
+///
+/// Both bare ids (`ring`, normalised to `curios:ring`) and canonical
+/// `namespace:id` ids are accepted (review #20).
 pub fn slot_type_index(id: &str) -> Option<u16> {
+    let wanted = qualify_slot_id(id);
     slot_types()
         .iter()
-        .position(|slot| slot.id() == id)
+        .position(|slot| slot.qualified_id() == wanted)
         .and_then(|index| u16::try_from(index).ok())
+}
+
+/// Looks up a slot type by canonical `namespace:id`.
+pub fn slot_type_by_qualified_id(id: &str) -> Option<SlotType> {
+    let wanted = qualify_slot_id(id);
+    slot_types()
+        .iter()
+        .find(|slot| slot.qualified_id() == wanted)
+        .cloned()
 }
 
 /// The slot type at an index from [`slot_type_index`].
@@ -117,5 +136,12 @@ mod tests {
             assert_eq!(slot_type_at(index as u16).as_ref(), Some(slot));
         }
         assert_eq!(slot_type_index("missing"), None);
+        // Bare and canonical ids resolve to the same bundled slot (review #20).
+        assert_eq!(slot_type_index("curios:ring"), slot_type_index("ring"));
+        assert_eq!(
+            slot_type_by_qualified_id("curios:ring").map(|slot| slot.id().to_owned()),
+            Some("ring".to_owned())
+        );
+        assert!(slot_type_by_qualified_id("mymod:ring").is_none());
     }
 }

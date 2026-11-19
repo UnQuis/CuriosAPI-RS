@@ -432,6 +432,8 @@ impl From<CodecError> for NetError {
 /// inventory stays on the server.
 #[derive(Clone, Debug, Default)]
 pub struct ClientState {
+    /// Entity whose slots the mirror describes. Packets for another entity are ignored.
+    pub entity_id: i32,
     pub handlers: Vec<NetHandler>,
     pub modifiers: Vec<NetModifier>,
     pub declarations: Vec<NetSlotDeclaration>,
@@ -442,6 +444,7 @@ pub struct ClientState {
 }
 
 static CLIENT_STATE: Mutex<ClientState> = Mutex::new(ClientState {
+    entity_id: -1,
     handlers: Vec::new(),
     modifiers: Vec::new(),
     declarations: Vec::new(),
@@ -465,6 +468,40 @@ static PAGES: Mutex<BTreeMap<u128, i32>> = Mutex::new(BTreeMap::new());
 
 fn pages() -> std::sync::MutexGuard<'static, BTreeMap<u128, i32>> {
     PAGES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Per-player cosmetic-view state. Only the server flips it; a toggle request
+/// from a client is validated against the player's own inventory first.
+static COSMETICS: Mutex<std::collections::BTreeSet<u128>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Flips a player's cosmetic view and returns the new value.
+pub fn toggle_cosmetics(uuid: u128) -> bool {
+    let mut set = COSMETICS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !set.remove(&uuid) {
+        set.insert(uuid);
+        true
+    } else {
+        false
+    }
+}
+
+/// Whether the player currently sees cosmetic slots.
+pub fn cosmetics_enabled(uuid: u128) -> bool {
+    COSMETICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&uuid)
+}
+
+/// Clamps a client request to the pages that actually exist. A client cannot
+/// choose an arbitrary page; the count comes from the server's slot registry.
+fn clamp_page(page: i32, slots: usize, per_page: usize) -> i32 {
+    if per_page == 0 {
+        return 0; // no page can exist without a page size
+    }
+    let pages = slots.div_ceil(per_page) as i32;
+    page.clamp(0, (pages - 1).max(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -503,71 +540,71 @@ pub fn register(r: &mut dyn Registrar) {
 
     install(
         &SYNC_STACK_TOKEN,
-        registrar.play_to_client_typed::<SyncStack>(id(channel::SYNC_STACK), |value, _| {
-            handle_server(ServerPacket::SyncStack(value))
+        registrar.play_to_client_typed::<SyncStack>(id(channel::SYNC_STACK), |value, context| {
+            handle_server(ServerPacket::SyncStack(value), context)
         }),
         channel::SYNC_STACK,
     );
     install(
         &GRABBED_ITEM_TOKEN,
-        registrar.play_to_client_typed::<GrabbedItem>(id(channel::GRABBED_ITEM), |value, _| {
-            handle_server(ServerPacket::GrabbedItem(value))
+        registrar.play_to_client_typed::<GrabbedItem>(id(channel::GRABBED_ITEM), |value, context| {
+            handle_server(ServerPacket::GrabbedItem(value), context)
         }),
         channel::GRABBED_ITEM,
     );
     install(
         &SYNC_CURIOS_TOKEN,
-        registrar.play_to_client_typed::<SyncCurios>(id(channel::SYNC_CURIOS), |value, _| {
-            handle_server(ServerPacket::SyncCurios(value))
+        registrar.play_to_client_typed::<SyncCurios>(id(channel::SYNC_CURIOS), |value, context| {
+            handle_server(ServerPacket::SyncCurios(value), context)
         }),
         channel::SYNC_CURIOS,
     );
     install(
         &SYNC_DATA_TOKEN,
-        registrar.play_to_client_typed::<SyncData>(id(channel::SYNC_DATA), |value, _| {
-            handle_server(ServerPacket::SyncData(value))
+        registrar.play_to_client_typed::<SyncData>(id(channel::SYNC_DATA), |value, context| {
+            handle_server(ServerPacket::SyncData(value), context)
         }),
         channel::SYNC_DATA,
     );
     install(
         &SYNC_MODIFIERS_TOKEN,
-        registrar.play_to_client_typed::<SyncModifiers>(id(channel::SYNC_MODIFIERS), |value, _| {
-            handle_server(ServerPacket::SyncModifiers(value))
+        registrar.play_to_client_typed::<SyncModifiers>(id(channel::SYNC_MODIFIERS), |value, context| {
+            handle_server(ServerPacket::SyncModifiers(value), context)
         }),
         channel::SYNC_MODIFIERS,
     );
     install(
         &SYNC_RENDER_TOKEN,
-        registrar.play_to_client_typed::<SyncRender>(id(channel::SYNC_RENDER), |value, _| {
-            handle_server(ServerPacket::SyncRender(value))
+        registrar.play_to_client_typed::<SyncRender>(id(channel::SYNC_RENDER), |value, context| {
+            handle_server(ServerPacket::SyncRender(value), context)
         }),
         channel::SYNC_RENDER,
     );
     install(
         &SYNC_ACTIVE_TOKEN,
-        registrar.play_to_client_typed::<SyncActive>(id(channel::SYNC_ACTIVE), |value, _| {
-            handle_server(ServerPacket::SyncActive(value))
+        registrar.play_to_client_typed::<SyncActive>(id(channel::SYNC_ACTIVE), |value, context| {
+            handle_server(ServerPacket::SyncActive(value), context)
         }),
         channel::SYNC_ACTIVE,
     );
     install(
         &BREAK_TOKEN,
-        registrar.play_to_client_typed::<Break>(id(channel::BREAK), |value, _| {
-            handle_server(ServerPacket::Break(value))
+        registrar.play_to_client_typed::<Break>(id(channel::BREAK), |value, context| {
+            handle_server(ServerPacket::Break(value), context)
         }),
         channel::BREAK,
     );
     install(
         &SERVER_PAGE_TOKEN,
-        registrar.play_to_client_typed::<ServerPage>(id(channel::SERVER_PAGE), |value, _| {
-            handle_server(ServerPacket::ServerPage(value))
+        registrar.play_to_client_typed::<ServerPage>(id(channel::SERVER_PAGE), |value, context| {
+            handle_server(ServerPacket::ServerPage(value), context)
         }),
         channel::SERVER_PAGE,
     );
     install(
         &QUICK_MOVE_TOKEN,
-        registrar.play_to_client_typed::<QuickMove>(id(channel::QUICK_MOVE), |value, _| {
-            handle_server(ServerPacket::QuickMove(value))
+        registrar.play_to_client_typed::<QuickMove>(id(channel::QUICK_MOVE), |value, context| {
+            handle_server(ServerPacket::QuickMove(value), context)
         }),
         channel::QUICK_MOVE,
     );
@@ -586,6 +623,18 @@ fn install<T>(slot: &OnceLock<ToClient<T>>, token: ToClient<T>, name: &'static s
 
 fn player(host: &dyn ServerHost, uuid: u128) -> Result<mod_api::PlayerRef, NetError> {
     host.player(uuid).ok_or(NetError::NoPlayer(uuid))
+}
+
+/// Sends a short result line to one player, reporting a failed delivery.
+fn feedback(host: &mut dyn ServerHost, uuid: u128, message: String) {
+    match player(host, uuid) {
+        Ok(target) => {
+            if let Err(error) = target.tell(host, mod_api::Text::literal(message)) {
+                eprintln!("[curios] feedback to {uuid} failed: {error:?}");
+            }
+        }
+        Err(error) => eprintln!("[curios] feedback target {uuid} is unavailable: {error:?}"),
+    }
 }
 
 fn send_to(host: &mut dyn ServerHost, uuid: u128, packet: ServerPacket) -> Result<(), NetError> {
@@ -731,7 +780,8 @@ pub fn sync_stack(
     )
 }
 
-/// Sends one render flag (`sync_render`).
+/// Sends one render flag about `uuid` to `uuid` itself. Kept for callers that
+/// only change their own slots (for example `place.rs`).
 pub fn sync_render(
     host: &mut dyn ServerHost,
     uuid: u128,
@@ -739,10 +789,25 @@ pub fn sync_render(
     slot_id: i32,
     value: bool,
 ) -> Result<(), NetError> {
-    let entity_id = player(host, uuid)?.entity().id() as i32;
+    sync_render_for(host, uuid, uuid, curio_id, slot_id, value)
+}
+
+/// Sends one render flag about `target_uuid` to `recipient_uuid`.
+///
+/// The packet's `entity_id` is the *actionable player's* id, never the id of
+/// whoever receives it: a flag about player A must say A to every observer.
+pub fn sync_render_for(
+    host: &mut dyn ServerHost,
+    recipient_uuid: u128,
+    target_uuid: u128,
+    curio_id: &str,
+    slot_id: i32,
+    value: bool,
+) -> Result<(), NetError> {
+    let entity_id = player(host, target_uuid)?.entity().id() as i32;
     send_to(
         host,
-        uuid,
+        recipient_uuid,
         ServerPacket::SyncRender(SyncRender {
             entity_id,
             curio_id: curio_id.to_owned(),
@@ -809,6 +874,9 @@ pub fn sync_modifiers(
 }
 
 /// Requests a break animation on the client (`break`).
+///
+/// Kept as a public server helper for gameplay code; the client mirror records
+/// the last animation but the pinned API has no dedicated renderer hook yet.
 pub fn break_effect(
     host: &mut dyn ServerHost,
     uuid: u128,
@@ -833,6 +901,9 @@ pub fn server_page(host: &mut dyn ServerHost, uuid: u128, window_id: i32, page: 
 }
 
 /// Defers a quick-move after a slot reset (`quick_move`).
+///
+/// The channel and mirror slot exist so the GUI action can be wired without a
+/// new payload; no production caller sends one until those actions exist.
 pub fn quick_move(
     host: &mut dyn ServerHost,
     uuid: u128,
@@ -940,15 +1011,28 @@ pub fn handle_client(
         }
         ClientPacket::ClientPage { window_id, next } => {
             let current = *pages().get(&uuid).unwrap_or(&0);
-            let page = if next { current + 1 } else { current.saturating_sub(1) };
+            let requested = if next {
+                current.saturating_add(1)
+            } else {
+                current.saturating_sub(1)
+            };
+            let slots: usize = crate::registry::slot_types()
+                .iter()
+                .map(|slot| usize::try_from(slot.size()).unwrap_or(0))
+                .sum();
+            let per_page = usize::from(crate::config::current().server.max_slots_per_page);
+            let page = clamp_page(requested, slots, per_page);
             pages().insert(uuid, page);
             server_page(host, uuid, window_id, page).map_err(|error| format!("{error:?}"))?;
         }
         ClientPacket::ToggleCosmetics { window_id } => {
+            // The toggle is a real server-side state change; the client only asks.
+            let shown = toggle_cosmetics(uuid);
             let inventory = read_inventory(host, uuid).map_err(|error| format!("{error:?}"))?;
             sync_inventory(host, uuid, &inventory).map_err(|error| format!("{error:?}"))?;
             let page = *pages().get(&uuid).unwrap_or(&0);
             server_page(host, uuid, window_id, page).map_err(|error| format!("{error:?}"))?;
+            feedback(host, uuid, format!("cosmetic view {}", if shown { "on" } else { "off" }));
         }
         ClientPacket::ToggleRender { identifier, index } => {
             let mut inventory = read_inventory(host, uuid).map_err(|error| format!("{error:?}"))?;
@@ -973,7 +1057,9 @@ pub fn handle_client(
                 .map(|other| other.uuid())
                 .collect();
             for other_uuid in targets {
-                if let Err(error) = sync_render(host, other_uuid, &identifier, index, value) {
+                // The actor's id goes in the packet; the recipient decides whose
+                // mirror to update from it.
+                if let Err(error) = sync_render_for(host, other_uuid, uuid, &identifier, index, value) {
                     eprintln!("[curios] sync_render to {other_uuid} failed: {error:?}");
                 }
             }
@@ -983,14 +1069,41 @@ pub fn handle_client(
 }
 
 /// Applies one server packet to the client's render mirror.
-pub fn handle_server(packet: ServerPacket) -> Result<(), String> {
+///
+/// The context is used only for the `grabbed_item` side effect: the returned
+/// stack is handed to `input::apply_grabbed_item` on the client host. All other
+/// packets only update the mirror and never touch the game.
+pub fn handle_server(packet: ServerPacket, context: &mut dyn IPayloadContext) -> Result<(), String> {
+    if let ServerPacket::GrabbedItem(ref value) = packet
+        && let Some(ref tag) = value.stack
+    {
+        let host = context
+            .client_host()
+            .map_err(|error| format!("grabbed_item needs a client host: {error:?}"))?;
+        let stack = net_to_stack(&*host, tag)
+            .map_err(|error| format!("grabbed_item stack was refused: {error:?}"))?;
+        crate::input::apply_grabbed_item(host, &stack);
+    }
+    apply_server_packet(packet)
+}
+
+/// Pure part of [`handle_server`]; also used by the unit tests without a context.
+fn apply_server_packet(packet: ServerPacket) -> Result<(), String> {
     match packet {
         ServerPacket::SyncCurios(value) => {
-            client_state().handlers = value.handlers;
+            let mut state = client_state();
+            state.entity_id = value.entity_id;
+            state.handlers = value.handlers;
             Ok(())
         }
         ServerPacket::SyncStack(value) => {
             let mut state = client_state();
+            if state.entity_id != value.entity_id {
+                return Err(format!(
+                    "sync_stack is for entity {} but the mirror tracks {}",
+                    value.entity_id, state.entity_id
+                ));
+            }
             let Some(handler) = state
                 .handlers
                 .iter_mut()
@@ -1025,6 +1138,12 @@ pub fn handle_server(packet: ServerPacket) -> Result<(), String> {
         }
         ServerPacket::SyncRender(value) => {
             let mut state = client_state();
+            if state.entity_id != value.entity_id {
+                return Err(format!(
+                    "sync_render is for entity {} but the mirror tracks {}",
+                    value.entity_id, state.entity_id
+                ));
+            }
             let Some(handler) = state
                 .handlers
                 .iter_mut()
@@ -1042,6 +1161,12 @@ pub fn handle_server(packet: ServerPacket) -> Result<(), String> {
         }
         ServerPacket::SyncActive(value) => {
             let mut state = client_state();
+            if state.entity_id != value.entity_id {
+                return Err(format!(
+                    "sync_active is for entity {} but the mirror tracks {}",
+                    value.entity_id, state.entity_id
+                ));
+            }
             let Some(handler) = state
                 .handlers
                 .iter_mut()
@@ -1252,6 +1377,61 @@ mod tests {
     }
 
     #[test]
+    fn page_requests_are_clamped_to_existing_pages() {
+        assert_eq!(clamp_page(0, 100, 48), 0);
+        assert_eq!(clamp_page(1, 100, 48), 1);
+        assert_eq!(clamp_page(99, 100, 48), 2);
+        assert_eq!(clamp_page(-5, 100, 48), 0);
+        assert_eq!(clamp_page(7, 0, 48), 0);
+        assert_eq!(clamp_page(7, 10, 0), 0);
+    }
+
+    #[test]
+    fn cosmetics_toggle_is_a_real_server_state() {
+        let uuid = u128::MAX;
+        if cosmetics_enabled(uuid) {
+            toggle_cosmetics(uuid);
+        }
+        assert!(toggle_cosmetics(uuid));
+        assert!(cosmetics_enabled(uuid));
+        assert!(!toggle_cosmetics(uuid));
+        assert!(!cosmetics_enabled(uuid));
+    }
+
+    #[test]
+    fn render_flags_for_another_entity_are_ignored() {
+        apply_server_packet(ServerPacket::SyncCurios(SyncCurios {
+            entity_id: 7,
+            handlers: vec![NetHandler {
+                curio_id: "ring".to_owned(),
+                stacks: vec![None],
+                cosmetic: Vec::new(),
+                render: vec![true],
+                active: vec![true],
+                drop_rule: "default".to_owned(),
+                use_native_gui: false,
+            }],
+        }))
+        .unwrap();
+        let foreign = ServerPacket::SyncRender(SyncRender {
+            entity_id: 8,
+            curio_id: "ring".to_owned(),
+            slot_id: 0,
+            value: false,
+        });
+        assert!(apply_server_packet(foreign).is_err());
+        assert!(client_snapshot().handlers[0].render[0]);
+        apply_server_packet(ServerPacket::SyncRender(SyncRender {
+            entity_id: 7,
+            curio_id: "ring".to_owned(),
+            slot_id: 0,
+            value: false,
+        }))
+        .unwrap();
+        assert!(!client_snapshot().handlers[0].render[0]);
+    }
+
+    #[test]
     fn truncated_and_random_payload_bodies_are_refused() {
         let value = NetTag::Compound(vec![
             NetEntry {
@@ -1309,12 +1489,12 @@ mod tests {
             drop_rule: "default".to_owned(),
             use_native_gui: false,
         };
-        handle_server(ServerPacket::SyncCurios(SyncCurios {
+        apply_server_packet(ServerPacket::SyncCurios(SyncCurios {
             entity_id: 1,
             handlers: vec![handler],
         }))
         .unwrap();
-        handle_server(ServerPacket::SyncRender(SyncRender {
+        apply_server_packet(ServerPacket::SyncRender(SyncRender {
             entity_id: 1,
             curio_id: "ring".to_owned(),
             slot_id: 1,
@@ -1323,7 +1503,7 @@ mod tests {
         .unwrap();
         let state = client_snapshot();
         assert_eq!(state.handlers[0].render, vec![true, false]);
-        assert!(handle_server(ServerPacket::SyncRender(SyncRender {
+        assert!(apply_server_packet(ServerPacket::SyncRender(SyncRender {
             entity_id: 1,
             curio_id: "missing".to_owned(),
             slot_id: 0,

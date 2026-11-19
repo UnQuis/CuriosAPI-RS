@@ -26,7 +26,7 @@
 //! * Equip sound: no `getEquipSound` hook exists. The engine plays sound from
 //!   `LivingRef::set_equipment`; Curio sound overrides are not representable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::{Mutex, OnceLock};
@@ -189,21 +189,39 @@ static TICK_EFFECTS: Mutex<BTreeMap<u32, CurioEffects>> = Mutex::new(BTreeMap::n
 /// tick-fresh snapshot is necessary there.
 pub fn refresh_effects(host: &mut dyn ServerHost) {
     let mut values = BTreeMap::new();
-    for player in host.players().server_players() {
-        let entity = player.entity();
-        values.insert(entity.id(), aggregate_for_entity(host, entity));
+    // Mobs receive `living_breathe` too, so the cache must cover every loaded
+    // entity, not just online players (review #19).
+    for level in host.levels().list_levels() {
+        let Some(entities) = level.all_entities(host) else {
+            continue;
+        };
+        for entity in entities {
+            values.insert(entity.id(), aggregate_for_entity(host, entity));
+        }
     }
     let mut cache = TICK_EFFECTS.lock().unwrap_or_else(|e| e.into_inner());
     *cache = values;
 }
 
+static REPORTED_MISSES: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+
 /// Cached effects for an entity id, last refreshed by [`refresh_effects`].
+///
+/// A miss is reported once per entity instead of silently granting no effects
+/// (review #19); the hook still gets safe defaults after the diagnostic.
 pub fn cached_effects(entity_id: u32) -> CurioEffects {
-    TICK_EFFECTS
+    let effects = TICK_EFFECTS
         .lock()
         .ok()
-        .and_then(|cache| cache.get(&entity_id).cloned())
-        .unwrap_or_default()
+        .and_then(|cache| cache.get(&entity_id).cloned());
+    if let Some(effects) = effects {
+        return effects;
+    }
+    let mut reported = REPORTED_MISSES.lock().unwrap_or_else(|e| e.into_inner());
+    if reported.insert(entity_id) {
+        eprintln!("[curios] effects cache miss for entity {entity_id}; refresh_effects did not see it");
+    }
+    CurioEffects::default()
 }
 
 /// Aggregates effects by canonical item id, without needing a host.

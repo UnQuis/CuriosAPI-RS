@@ -7,7 +7,7 @@
 //! Adapted from TheIllusiveC4/Curios (LGPL-3.0-or-later, copyright 2018-2024
 //! C4); see COPYING and COPYING.LESSER.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mod_api::{
     ClientHost, HandlerThread, IPayloadContext, IPayloadHandler, KeyConflictContext,
@@ -61,6 +61,53 @@ pub const ACTION_PAGE_PREV: u8 = 2;
 pub const ACTION_TOGGLE_COSMETICS: u8 = 3;
 pub const ACTION_DESTROY: u8 = 4;
 pub const ACTION_OPEN_VANILLA: u8 = 5;
+
+/// A client-side button press that a screen hook observed but could not send:
+/// those hooks hold an immutable `ClientHost`. `flush_pending_actions` drains
+/// this queue from `key_mapping_pre`, which does have a mutable host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingAction {
+    PageNext,
+    PagePrev,
+    ToggleCosmetics,
+    ToggleRender(usize),
+    Destroy,
+    OpenVanilla,
+}
+
+static PENDING: Mutex<Vec<PendingAction>> = Mutex::new(Vec::new());
+
+pub fn queue(action: PendingAction) {
+    let mut guard = PENDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.push(action);
+}
+
+/// Sends every queued action and returns the number delivered. A send failure
+/// is reported instead of silently dropping the request.
+pub fn flush_pending_actions(host: &mut dyn ClientHost) -> usize {
+    let actions: Vec<PendingAction> = std::mem::take(
+        &mut *PENDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let mut sent = 0usize;
+    for action in actions {
+        let ok = match action {
+            PendingAction::PageNext => send_page(host, true),
+            PendingAction::PagePrev => send_page(host, false),
+            PendingAction::ToggleCosmetics => send_toggle_cosmetics(host),
+            PendingAction::ToggleRender(slot) => send_render_toggle(host, slot),
+            PendingAction::Destroy => send_destroy(host),
+            PendingAction::OpenVanilla => send_open_vanilla(host),
+        };
+        if ok {
+            sent += 1;
+        } else {
+            eprintln!("[curios] queued menu action {action:?} could not be sent");
+        }
+    }
+    sent
+}
 
 /// Encodes a screen snapshot. Layout: page, cosmetic, cell count, then for
 /// each cell `(index u16 LE, flags u8, nbt length u16 LE, nbt bytes)`.
@@ -397,10 +444,14 @@ impl IPayloadHandler for ScreenStateHandler {
         context: &mut dyn IPayloadContext,
     ) -> Result<(), PayloadHandleError> {
         let (page, cosmetic, cells) = decode_screen_state(&payload)?;
+        let uuid = context
+            .player()
+            .map_err(|error| PayloadHandleError::Failed(format!("{error:?}")))?
+            .uuid();
         let host = context
             .client_host()
             .map_err(|error| PayloadHandleError::Failed(format!("{error:?}")))?;
-        crate::menu::apply_screen_state(host, page, cosmetic, &cells);
+        crate::menu::apply_screen_state(uuid, host, page, cosmetic, &cells);
         Ok(())
     }
 }
@@ -436,6 +487,26 @@ mod tests {
         assert!(decode_open_request(&PayloadBytes(Vec::new())).is_err());
         assert!(decode_open_request(&PayloadBytes(vec![0b0000_0010])).is_err());
         assert!(decode_open_request(&PayloadBytes(vec![OPEN_ACTION, 0])).is_err());
+    }
+
+    #[test]
+    fn screen_actions_queue_in_order() {
+        let mut guard = PENDING.lock().unwrap();
+        guard.clear();
+        drop(guard);
+        queue(PendingAction::PageNext);
+        queue(PendingAction::ToggleRender(5));
+        queue(PendingAction::ToggleCosmetics);
+        let mut guard = PENDING.lock().unwrap();
+        assert_eq!(
+            *guard,
+            vec![
+                PendingAction::PageNext,
+                PendingAction::ToggleRender(5),
+                PendingAction::ToggleCosmetics
+            ]
+        );
+        guard.clear();
     }
 
     #[test]

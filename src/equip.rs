@@ -5,11 +5,13 @@
 //! `CurioCanEquipEvent`, `CurioCanUnequipEvent` and `CuriosCommonEvents.handleDrops`
 //! of TheIllusiveC4/Curios (LGPL-3.0-or-later, copyright 2018-2024 C4).
 
+use mod_api::{GameRuleValue, Host, Identifier, ItemKey, LevelRef};
+
 use crate::config;
 use crate::curio::{self, CurioContext};
 use crate::drop::{self, DropDecision, DropRules, ItemPredicate};
 use crate::inventory::ItemSnapshot;
-use crate::slots::{SlotContext, SlotType};
+use crate::slots::{SlotContext, SlotType, SlotValidator};
 
 /// Outcome of an external equip event, mirroring Java `TriState`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -33,18 +35,69 @@ impl TriState {
     }
 }
 
-/// Whether an item passes a slot's validators.
+/// Whether an item passes a slot's validators, with an injected predicate.
 ///
-/// The `curios:tag` predicate is approximated by the item's own curio tag
-/// (`curios:<slot id>`) or the universal `curios:curio` tag, matching Java
-/// `CuriosSlots.testPredicates` for the bundled slot definitions.
-pub fn is_stack_valid(slot: &SlotType, context: &SlotContext, item_id: &str) -> bool {
-    let expected = format!("curios:{}", slot.id());
-    slot.is_item_valid(context, &item_id, |validator, _, item| {
+/// This is the pure core used by unit tests; production must use
+/// [`is_stack_valid_host`], which resolves real item tags through the host.
+pub fn is_stack_valid_with<F>(
+    slot: &SlotType,
+    context: &SlotContext,
+    item_id: &str,
+    test: F,
+) -> bool
+where
+    F: Fn(&SlotValidator, &SlotContext, &str) -> bool,
+{
+    slot.is_item_valid(context, &item_id, |validator, context, _| {
+        test(validator, context, item_id)
+    })
+}
+
+/// Server-authoritative validator resolution through Horizon's merged tags.
+///
+/// Mirrors Java `CuriosSlots`: `curios:<slot id>` or `curios:curio` membership.
+/// A missing tag or an unavailable tag table yields `false`, never a guessed
+/// string match, so a real item id like `mymod:ring` is accepted only when its
+/// registry tag actually contains it.
+pub fn is_stack_valid_host(
+    host: &dyn Host,
+    slot: &SlotType,
+    context: &SlotContext,
+    item: ItemKey,
+) -> bool {
+    let Ok(slot_tag_id) = Identifier::parse(&format!("curios:{}", slot.id())) else {
+        eprintln!("[curios] slot id `{}` is not a valid tag id", slot.id());
+        return false;
+    };
+    let Ok(curio_tag_id) = Identifier::parse("curios:curio") else {
+        return false;
+    };
+    let slot_tag = host.tags().key(&slot_tag_id);
+    let curio_tag = host.tags().key(&curio_tag_id);
+    let in_tag = |tag: Option<mod_api::TagKey>| {
+        tag.and_then(|key| host.tags().is_in_tag(item, key)).unwrap_or(false)
+    };
+    let slot_member = in_tag(slot_tag);
+    let curio_member = in_tag(curio_tag);
+    is_stack_valid_with(slot, context, "", |validator, _, _| {
         match validator.resource_id().as_str().as_str() {
             "curios:all" => true,
             "curios:none" => false,
-            "curios:tag" => *item == expected || *item == "curios:curio",
+            "curios:tag" => slot_member || curio_member,
+            _ => false,
+        }
+    })
+}
+
+/// Pure string-tag approximation, kept for the public API and unit tests.
+/// It cannot validate real items; call [`is_stack_valid_host`] in production.
+pub fn is_stack_valid(slot: &SlotType, context: &SlotContext, item_id: &str) -> bool {
+    let expected = format!("curios:{}", slot.id());
+    is_stack_valid_with(slot, context, item_id, |validator, _, item| {
+        match validator.resource_id().as_str().as_str() {
+            "curios:all" => true,
+            "curios:none" => false,
+            "curios:tag" => item == expected.as_str() || item == "curios:curio",
             _ => false,
         }
     })
@@ -59,6 +112,29 @@ pub fn can_equip(
     event: TriState,
 ) -> bool {
     let original = is_stack_valid(slot, context, item_id)
+        && curio::behavior(item_id).is_none_or(|behavior| {
+            curio::accepts_slot(behavior.as_ref(), slot.id())
+                && behavior.can_equip(&CurioContext {
+                    slot: slot.id(),
+                    index: context.index as u32,
+                    item: item_id,
+                })
+        });
+    let mut dispatched = crate::events::CurioCanEquipEvent::new(item_id, context.clone(), original);
+    let result = crate::events::can_equip_override(&mut dispatched);
+    event.apply(result.apply(original))
+}
+
+/// Host-aware counterpart of [`can_equip`] used by `PlaceProvider::insert`.
+pub fn can_equip_host(
+    host: &dyn Host,
+    slot: &SlotType,
+    context: &SlotContext,
+    item: ItemKey,
+    item_id: &str,
+    event: TriState,
+) -> bool {
+    let original = is_stack_valid_host(host, slot, context, item)
         && curio::behavior(item_id).is_none_or(|behavior| {
             curio::accepts_slot(behavior.as_ref(), slot.id())
                 && behavior.can_equip(&CurioContext {
@@ -87,16 +163,33 @@ pub fn can_unequip(context: &SlotContext, item_id: &str, event: TriState) -> boo
     event.apply(result.apply(original))
 }
 
+/// Resolves the `keep_inventory` rule for one level at the gameplay call site.
+///
+/// `keep_curios = default` follows the live game rule; `on`/`off` force it.
+/// Errors are returned so a failed read never silently keeps or drops items.
+pub fn keep_inventory_from_level(host: &dyn Host, level: LevelRef) -> Result<bool, String> {
+    let value = level
+        .game_rule(host, "keep_inventory")
+        .map_err(|error| format!("could not read keep_inventory game rule: {error:?}"))?;
+    match value {
+        Some(GameRuleValue::Bool(rule)) => Ok(config::keep_inventory(rule)),
+        Some(other) => Err(format!("keep_inventory is not a boolean: {other}")),
+        None => Err("keep_inventory game rule is absent".to_owned()),
+    }
+}
+
 /// Resolves the death-drop outcome for one stored item.
 ///
 /// Overrides come first, then the item's own rule, then the slot's rule.
-/// `keep_inventory` is derived from the server's `keep_curios` setting and the
-/// game rule; `drop_prevented` stands for `PREVENT_EQUIPMENT_DROP`.
+/// `keep_inventory` must be resolved at the call site with
+/// [`keep_inventory_from_level`]; `drop_prevented` stands for
+/// `PREVENT_EQUIPMENT_DROP`.
 pub fn decide_death_drop<P>(
     rules: &DropRules<P>,
     item: &ItemSnapshot,
     item_rule: drop::DropRule,
     slot_rule: drop::DropRule,
+    keep_inventory: bool,
     drop_prevented: bool,
 ) -> DropDecision
 where
@@ -107,7 +200,7 @@ where
         item,
         item_rule,
         slot_rule,
-        !config::drops_on_death(),
+        keep_inventory,
         drop_prevented,
     )
 }
@@ -119,6 +212,7 @@ pub fn decide_death_drop_with_events(
     item: &ItemSnapshot,
     item_rule: drop::DropRule,
     slot_rule: drop::DropRule,
+    keep_inventory: bool,
     drop_prevented: bool,
 ) -> DropDecision {
     let mut event = crate::events::DropRulesEvent {
@@ -131,6 +225,7 @@ pub fn decide_death_drop_with_events(
         item,
         item_rule,
         slot_rule,
+        keep_inventory,
         drop_prevented,
     )
 }
@@ -205,14 +300,20 @@ mod tests {
     }
 
     #[test]
-    fn tag_predicate_accepts_own_and_universal_tag() {
+    fn injected_tag_predicate_accepts_real_item_ids() {
         let types = crate::registry::slot_types();
         let slot = types.iter().find(|slot| slot.id() == "ring").unwrap();
         let ctx = context("ring");
-        assert!(is_stack_valid(slot, &ctx, "curios:ring"));
-        assert!(is_stack_valid(slot, &ctx, "curios:curio"));
-        assert!(!is_stack_valid(slot, &ctx, "curios:necklace"));
-        assert!(can_equip(slot, &ctx, "curios:ring", TriState::False) == false);
+        // The old test asserted that a fake `curios:ring` item id passed. Real
+        // ids such as `mymod:ring` are decided by the injected tag predicate.
+        let tag_test = |validator: &SlotValidator, _: &SlotContext, item: &str| {
+            validator.resource_id().as_str().as_str() == "curios:tag"
+                && matches!(item, "mymod:ring" | "curios:curio")
+        };
+        assert!(is_stack_valid_with(slot, &ctx, "mymod:ring", tag_test));
+        assert!(is_stack_valid_with(slot, &ctx, "curios:curio", tag_test));
+        assert!(!is_stack_valid_with(slot, &ctx, "curios:necklace", tag_test));
+        assert!(!can_equip(slot, &ctx, "curios:ring", TriState::False));
         assert!(can_equip(slot, &ctx, "curios:ring", TriState::True));
     }
 }

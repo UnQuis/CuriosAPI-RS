@@ -15,15 +15,19 @@
 //! Adapted from TheIllusiveC4/Curios (LGPL-3.0-or-later, copyright 2018-2024
 //! C4); see COPYING and COPYING.LESSER.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use mod_api::{
-    ClientHost, Compound, DrawContext, Flow, Holder, ItemPlace, ItemStack, MenuReplace, ModContainer,
-    ScreenRenderBackgroundEvent, ScreenRenderPostEvent, ScreenView, ServerHost, Tag, Text,
+    ClientHost, Compound, DrawContext, Flow, Holder, HostTransaction, ItemPlace, ItemResource, ItemStack, MenuReplace,
+    ModContainer, ScreenRenderBackgroundEvent, ScreenRenderPostEvent, ScreenView, ServerHost, Tag,
+    Text,
 };
 
 use crate::config;
+use crate::equip::{self, TriState};
 use crate::input::{self, ScreenCellWire};
+use crate::slots::SlotContext;
 use crate::lang;
 use crate::place;
 use crate::registry;
@@ -205,30 +209,41 @@ pub struct ScreenSnapshot {
     pub cells: Vec<ScreenCell>,
 }
 
-static SCREEN_STATE: Mutex<Option<ScreenSnapshot>> = Mutex::new(None);
-
-static STATE: Mutex<Option<MenuState>> = Mutex::new(None);
-
-/// Window id of the menu opened by this mod on the server. Client requests
-/// carry an action only, so a stale client cannot address another menu.
-static OPEN_WINDOW: Mutex<Option<i32>> = Mutex::new(None);
-
-fn open_window() -> Option<i32> {
-    OPEN_WINDOW
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .copied()
+/// Everything one player's Curios screen needs. A process-global page, window
+/// or snapshot would let a second player overwrite the first player's view.
+#[derive(Clone, Debug, Default)]
+pub struct PlayerMenu {
+    pub state: MenuState,
+    pub window: Option<i32>,
+    pub screen: Option<ScreenSnapshot>,
 }
 
-fn with_state<R>(default: R, f: impl FnOnce(&mut MenuState) -> R) -> R {
-    let mut guard = STATE
+static MENUS: Mutex<BTreeMap<u128, PlayerMenu>> = Mutex::new(BTreeMap::new());
+
+fn with_player<R>(uuid: u128, _default: R, f: impl FnOnce(&mut PlayerMenu) -> R) -> R {
+    let mut guard = MENUS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match guard.as_mut() {
-        Some(state) => f(state),
-        None => default,
-    }
+    f(guard.entry(uuid).or_insert_with(PlayerMenu::default))
+}
+
+fn player_state(uuid: u128) -> MenuState {
+    with_player(uuid, MenuState::new(), |menu| menu.state.clone())
+}
+
+fn player_window(uuid: u128) -> Option<i32> {
+    with_player(uuid, None, |menu| menu.window)
+}
+
+fn player_screen(uuid: u128) -> Option<ScreenSnapshot> {
+    with_player(uuid, None, |menu| menu.screen.clone())
+}
+
+fn forget_player(uuid: u128) {
+    let mut guard = MENUS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.remove(&uuid);
 }
 
 /// A control under the pointer. Pure geometry, shared by drawing and input.
@@ -291,15 +306,23 @@ impl Layout {
     }
 
     pub fn hit(&self, at: [f32; 2]) -> Control {
-        for control in [
-            Control::PagePrev,
-            Control::PageNext,
-            Control::ToggleCosmetics,
-            Control::ToggleRender,
-        ] {
-            if let Some(rect) = self.button_rect(control) {
-                if contains(rect, at) {
-                    return control;
+        self.hit_with_buttons(at, true)
+    }
+
+    /// Hit-testing that honours the client `enable_button` setting (#24):
+    /// with buttons disabled their rectangles are not interactive.
+    pub fn hit_with_buttons(&self, at: [f32; 2], buttons: bool) -> Control {
+        if buttons {
+            for control in [
+                Control::PagePrev,
+                Control::PageNext,
+                Control::ToggleCosmetics,
+                Control::ToggleRender,
+            ] {
+                if let Some(rect) = self.button_rect(control) {
+                    if contains(rect, at) {
+                        return control;
+                    }
                 }
             }
         }
@@ -333,7 +356,7 @@ pub fn page_stacks(host: &mut dyn ServerHost, uuid: u128, page: usize) -> Vec<Op
         return result;
     };
     let entity = player.entity().id();
-    let cosmetic = with_state(false, |state| state.cosmetic);
+    let cosmetic = player_state(uuid).cosmetic;
     for (slot, cell) in display_cells(page, cosmetic).into_iter().enumerate() {
         if slot >= MENU_SLOTS {
             break;
@@ -351,30 +374,22 @@ pub fn page_stacks(host: &mut dyn ServerHost, uuid: u128, page: usize) -> Vec<Op
 pub fn open(host: &mut dyn ServerHost, uuid: u128) -> bool {
     let title = title();
     let items = page_stacks(host, uuid, 0);
-    let mut guard = STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some(MenuState::new());
-    drop(guard);
+    with_player(uuid, (), |menu| {
+        menu.state = MenuState::new();
+        menu.window = None;
+        menu.screen = None;
+    });
     let opened = host.open_menu(uuid, MENU_ROWS, title, items, MenuReplace::CloseFirst);
-    let mut window_guard = OPEN_WINDOW
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match opened {
         Ok(Some(window)) => {
-            *window_guard = Some(window);
-            drop(window_guard);
+            with_player(uuid, (), |menu| menu.window = Some(window));
             if !sync_state(host, uuid) {
                 eprintln!("[curios] screen snapshot could not be sent to {uuid}");
             }
             true
         }
-        Ok(None) => {
-            *window_guard = None;
-            false
-        }
+        Ok(None) => false,
         Err(error) => {
-            *window_guard = None;
             eprintln!("[curios] could not open menu for {uuid}: {error:?}");
             false
         }
@@ -391,6 +406,7 @@ pub fn refresh(host: &mut dyn ServerHost, uuid: u128, window: i32, page: usize) 
 /// carried in the payload; an undecodable stack is dropped with a diagnostic
 /// rather than shown as a misleading empty slot.
 pub fn apply_screen_state(
+    uuid: u128,
     host: &mut dyn ClientHost,
     page: u8,
     cosmetic: bool,
@@ -435,18 +451,14 @@ pub fn apply_screen_state(
             slot_type,
         });
     }
-    let mut guard = SCREEN_STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some(ScreenSnapshot {
-        page: usize::from(page),
-        cosmetic,
-        cells,
-    });
-    drop(guard);
-    with_state((), |state| {
-        state.page = usize::from(page);
-        state.cosmetic = cosmetic;
+    with_player(uuid, (), |menu| {
+        menu.screen = Some(ScreenSnapshot {
+            page: usize::from(page),
+            cosmetic,
+            cells,
+        });
+        menu.state.page = usize::from(page);
+        menu.state.cosmetic = cosmetic;
     });
 }
 
@@ -456,8 +468,8 @@ pub fn sync_state(host: &mut dyn ServerHost, uuid: u128) -> bool {
     let Some(player) = host.player(uuid) else {
         return false;
     };
-    let page = with_state(0, |state| state.page);
-    let cosmetic = with_state(false, |state| state.cosmetic);
+    let page = player_state(uuid).page;
+    let cosmetic = player_state(uuid).cosmetic;
     let entity = player.entity().id();
     let holder = Holder::Entity(entity);
     let inventory = crate::inventory::INVENTORY.get(host, holder).ok();
@@ -511,15 +523,15 @@ pub fn sync_state(host: &mut dyn ServerHost, uuid: u128) -> bool {
 }
 
 /// Visible functional slot currently under the pointer, if our menu is open.
-pub fn hovered_render_slot() -> Option<usize> {
-    with_state(None, |state| state.hovering)
+pub fn hovered_render_slot(uuid: u128) -> Option<usize> {
+    player_state(uuid).hovering
 }
 
 /// Server-authoritative render toggle for one visible functional slot.
 /// Cosmetic slots have no independent render flag of their own: they follow
 /// the functional slot they are paired with, as in the Java reference.
 pub fn toggle_render(host: &mut dyn ServerHost, uuid: u128, slot: usize) -> bool {
-    let page = with_state(0, |state| state.page);
+    let page = player_state(uuid).page;
     let Some(cell) = visible_cells(page, false).get(slot).cloned() else {
         return false;
     };
@@ -551,13 +563,13 @@ pub fn toggle_render(host: &mut dyn ServerHost, uuid: u128, slot: usize) -> bool
 /// Server handler for Java `client_page`. The window comes from the menu this
 /// mod opened, never from the packet.
 pub fn client_page(host: &mut dyn ServerHost, uuid: u128, next: bool) -> bool {
-    let Some(window) = open_window() else {
+    let Some(window) = player_window(uuid) else {
         return false;
     };
-    with_state((), |state| {
-        state.advance(next);
+    with_player(uuid, (), |menu| {
+        menu.state.advance(next);
     });
-    let page = with_state(0, |state| state.page);
+    let page = player_state(uuid).page;
     let mirrored = refresh(host, uuid, window, page);
     sync_state(host, uuid) && mirrored
 }
@@ -565,11 +577,11 @@ pub fn client_page(host: &mut dyn ServerHost, uuid: u128, next: bool) -> bool {
 /// Server handler for Java `toggle_cosmetics`. The cosmetic view swaps the
 /// stacks shown in the same slots; it never duplicates slots.
 pub fn toggle_cosmetics(host: &mut dyn ServerHost, uuid: u128) -> bool {
-    let Some(window) = open_window() else {
+    let Some(window) = player_window(uuid) else {
         return false;
     };
-    with_state((), |state| state.toggle_cosmetic());
-    let page = with_state(0, |state| state.page);
+    with_player(uuid, (), |menu| menu.state.toggle_cosmetic());
+    let page = player_state(uuid).page;
     let mirrored = refresh(host, uuid, window, page);
     sync_state(host, uuid) && mirrored
 }
@@ -610,58 +622,118 @@ pub fn open_vanilla(host: &mut dyn ServerHost, uuid: u128) -> bool {
     true
 }
 
-/// Server hook: a click on a mirrored slot must not let the vanilla chest
-/// become a second storage. The click is consumed here; equip and unequip
-/// stay in the server-authoritative `equip` module.
-pub fn menu_clicked(host: &mut dyn ServerHost, uuid: u128, window: i32, slot: usize) -> bool {
+/// Server hook: a real item transaction. A click on a visible cell moves the
+/// stack between the vanilla menu slot and the Curio `ItemPlace::Mod`, after
+/// the same `canEquip`/`canUnequip` checks the API uses for any other equip.
+pub fn menu_clicked(host: &mut dyn ServerHost, uuid: u128, window: i32, raw_slot: i32) -> bool {
+    // #11: -999 must not become slot 0, and a click from another menu/window
+    // must never reach this player's Curio slots.
+    let Ok(slot) = usize::try_from(raw_slot) else {
+        return false;
+    };
+    if Some(window) != player_window(uuid) {
+        return false;
+    }
     let per_page = usize::from(config::current().server.max_slots_per_page);
     if slot >= per_page || slot >= MENU_SLOTS {
         return false;
     }
-    let page = with_state(0, |state| state.page);
-    if !refresh(host, uuid, window, page) {
-        eprintln!("[curios] could not restore menu slot {slot} after a click");
+    let Some(menu) = host.menu(uuid, window) else {
+        return false;
+    };
+    let state = player_state(uuid);
+    let Some(cell) = display_cells(state.page, state.cosmetic).get(slot).cloned() else {
+        return false;
+    };
+    let Some(player) = host.player(uuid) else {
+        return false;
+    };
+    let entity = player.entity().id();
+    let Some(target) = cell.place(entity) else {
+        return false;
+    };
+    let menu_place = ItemPlace::MenuSlot { menu, slot };
+    let menu_stack = menu_place.stack(host);
+    let curio_stack = target.stack(host);
+    let item_id = menu_stack
+        .as_ref()
+        .or(curio_stack.as_ref())
+        .map(|stack| stack.item().id(host))
+        .unwrap_or_default();
+    if item_id.is_empty() {
+        return false;
     }
+    let context = SlotContext::new(
+        cell.slot_type.clone(),
+        Some(u64::from(entity)),
+        cell.index,
+        cell.cosmetic,
+        true,
+    );
+    let slot_type = registry::slot_types()
+        .iter()
+        .find(|candidate| candidate.id() == cell.slot_type)
+        .cloned();
+    let moving_in = menu_stack.is_some();
+    let allowed = if moving_in {
+        match slot_type.as_ref() {
+            Some(slot_type) => equip::can_equip(slot_type, &context, &item_id, TriState::Default),
+            None => false,
+        }
+    } else {
+        equip::can_unequip(&context, &item_id, TriState::Default)
+    };
+    if !allowed {
+        return false;
+    }
+    let stack = match if moving_in { menu_stack.as_ref() } else { curio_stack.as_ref() } {
+        Some(stack) => stack,
+        None => return false,
+    };
+    let count = stack.count();
+    if count == 0 {
+        return false;
+    }
+    let resource = ItemResource::of(stack);
+    // Both legs are journaled in one transaction: a half move is never kept.
+    let moved: Result<u32, ()> = host.transaction(|host, tx| {
+        let (from, to) = if moving_in {
+            (&menu_place, &target)
+        } else {
+            (&target, &menu_place)
+        };
+        let inserted = to.insert(host, tx, &resource, count);
+        if inserted != count {
+            return Err(());
+        }
+        let extracted = from.extract(host, tx, &resource, count);
+        if extracted == count { Ok(count) } else { Err(()) }
+    });
+    if moved.is_err() {
+        eprintln!("[curios] menu click transaction aborted for {item_id}");
+        return false;
+    }
+    let page = player_state(uuid).page;
+    let mirrored = refresh(host, uuid, window, page);
     if !sync_state(host, uuid) {
         eprintln!("[curios] screen snapshot could not be refreshed after a click");
     }
-    true
+    mirrored
 }
 
-pub fn menu_closed() {
-    let mut guard = STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.take();
-    let mut window = OPEN_WINDOW
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    window.take();
-    let mut screen = SCREEN_STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    screen.take();
+pub fn menu_closed(uuid: u128) {
+    forget_player(uuid);
 }
 
 /// Client hook: initialise state when our menu screen opens.
-pub fn screen_opening(view: &ScreenView<'_>) {
+pub fn screen_opening(uuid: u128, view: &ScreenView<'_>) {
     if !is_ours(view) {
         return;
     }
-    let mut guard = STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match guard.as_mut() {
-        Some(state) => {
-            state.hovering = None;
-            state.origin = [view.rect[0], view.rect[1]];
-        }
-        None => {
-            let mut state = MenuState::new();
-            state.origin = [view.rect[0], view.rect[1]];
-            *guard = Some(state);
-        }
-    }
+    with_player(uuid, (), |menu| {
+        menu.state.hovering = None;
+        menu.state.origin = [view.rect[0], view.rect[1]];
+    });
 }
 
 /// Sprite path for one cell. Cosmetic pairs share the upstream cosmetic icon.
@@ -676,7 +748,7 @@ pub fn slot_icon(cell: &ScreenCell) -> String {
 /// Client hook: paints the Curios panel under the menu's own widgets. The
 /// vanilla chest is only the container backing; this is the screen the player
 /// actually sees.
-pub fn screen_render_background(_host: &dyn ClientHost, event: &mut ScreenRenderBackgroundEvent<'_>) {
+pub fn screen_render_background(_uuid: u128, _host: &dyn ClientHost, event: &mut ScreenRenderBackgroundEvent<'_>) {
     if !is_ours(event.screen) {
         return;
     }
@@ -695,7 +767,7 @@ pub fn screen_render_background(_host: &dyn ClientHost, event: &mut ScreenRender
 }
 
 /// Client hook: buttons and hover tooltips are drawn over the screen.
-pub fn screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
+pub fn screen_render_post(uuid: u128, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
     if !is_ours(event.screen) {
         return;
     }
@@ -704,10 +776,10 @@ pub fn screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPostEve
         Control::Slot(index) => Some(index),
         _ => None,
     };
-    let state = with_state(MenuState::new(), |state| {
-        state.origin = [event.screen.rect[0], event.screen.rect[1]];
-        state.hovering = hovered_slot;
-        state.clone()
+    let state = with_player(uuid, MenuState::new(), |menu| {
+        menu.state.origin = [event.screen.rect[0], event.screen.rect[1]];
+        menu.state.hovering = hovered_slot;
+        menu.state.clone()
     });
     let layout = Layout::new(event.screen.rect);
     let locale = lang::locale(host);
@@ -728,10 +800,7 @@ pub fn screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPostEve
 
     // Draw every visible cell from the server snapshot, not from the vanilla
     // menu slots. The engine's own stacks are underneath our opaque panel.
-    let snapshot = SCREEN_STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let snapshot = player_screen(uuid);
     if let Some(snapshot) = snapshot {
         for (position, cell) in snapshot.cells.iter().enumerate().take(MENU_SLOTS) {
             let rect = layout.slot_rect(position);
@@ -767,35 +836,30 @@ pub fn screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPostEve
             if cell.cosmetic {
                 event.draw.text("C", [rect[0] + rect[2] - 7.0, rect[1]], 0xFF_E879FF, true);
             }
-            let label = lang::slot_name(locale, &cell.slot_type)
-                .unwrap_or(cell.slot_type.as_str());
-            event.draw.text(label, [rect[0], rect[1] + rect[3] + 1.0], 0xFF_8C7AA8, false);
+            let label = lang::slot_name(locale, &cell.slot_type);
+            event.draw.text(&label, [rect[0], rect[1] + rect[3] + 1.0], 0xFF_8C7AA8, false);
         }
     }
 
-    draw_button(event.draw, layout, Control::PagePrev, "<");
-    draw_button(
-        event.draw,
-        layout,
-        Control::ToggleCosmetics,
-        if state.cosmetic { "C" } else { "c" },
-    );
-    draw_button(event.draw, layout, Control::ToggleRender, "R");
-    draw_button(event.draw, layout, Control::PageNext, ">");
+    // #24: the client setting decides whether any control is shown at all.
+    if config::current().render.enable_button {
+        draw_button(event.draw, layout, Control::PagePrev, "<");
+        draw_button(
+            event.draw,
+            layout,
+            Control::ToggleCosmetics,
+            if state.cosmetic { "C" } else { "c" },
+        );
+        draw_button(event.draw, layout, Control::ToggleRender, "R");
+        draw_button(event.draw, layout, Control::PageNext, ">");
+    }
 
     // Tooltips are drawn with plain text: the block-scoped screen_tooltip hook
     // cannot fire for Curios, which has no block.
     if let Some(index) = hovered_slot {
-        let snapshot = SCREEN_STATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let snapshot = player_screen(uuid);
         if let Some(cell) = snapshot.and_then(|snapshot| snapshot.cells.into_iter().nth(index)) {
-            let mut lines = vec![
-                lang::slot_name(locale, &cell.slot_type)
-                    .unwrap_or(cell.slot_type.as_str())
-                    .to_owned(),
-            ];
+            let mut lines = vec![lang::slot_name(locale, &cell.slot_type)];
             if cell.cosmetic {
                 lines.push(
                     lang::lookup(locale, lang::KEY_COSMETIC)
@@ -827,11 +891,7 @@ pub fn screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPostEve
 /// disabled. `screen_tooltip` and `screen_render_post` share this.
 pub fn tooltip_lines(host: &dyn ClientHost, cell: &Cell, inactive: bool) -> Vec<Text> {
     let locale = lang::locale(host);
-    let mut lines = vec![Text::literal(
-        lang::slot_name(locale, &cell.slot_type)
-            .unwrap_or(cell.slot_type.as_str())
-            .to_owned(),
-    )];
+    let mut lines = vec![Text::literal(lang::slot_name(locale, &cell.slot_type))];
     if cell.cosmetic {
         lines.push(Text::literal(
             lang::lookup(locale, lang::KEY_COSMETIC)
@@ -854,13 +914,14 @@ pub fn tooltip_lines(host: &dyn ClientHost, cell: &Cell, inactive: bool) -> Vec<
 /// generic screen hook with an empty `block`/`data`. The origin remembered by
 /// the last draw call is used for hit-testing.
 pub fn screen_tooltip(
+    uuid: u128,
     host: &dyn ClientHost,
     _block: &str,
     _data: &[i32],
     at: [f32; 2],
     lines: &mut Vec<String>,
 ) {
-    let state = with_state(MenuState::new(), |state| state.clone());
+    let state = player_state(uuid);
     let control = Layout::new([state.origin[0], state.origin[1], PANEL_W, 256.0]).hit(at);
     let Control::Slot(index) = control else {
         return;
@@ -870,10 +931,7 @@ pub fn screen_tooltip(
         return;
     };
     let locale = lang::locale(host);
-    let name = lang::slot_name(locale, &cell.slot_type)
-        .unwrap_or(cell.slot_type.as_str())
-        .to_owned();
-    lines.push(name);
+    lines.push(lang::slot_name(locale, &cell.slot_type));
     if cell.cosmetic {
         lines.push(
             lang::lookup(locale, lang::KEY_COSMETIC)
@@ -890,38 +948,49 @@ fn draw_button(draw: &mut dyn DrawContext, layout: Layout, control: Control, lab
     }
 }
 
-/// Client hook: page and cosmetic controls. Returning `Cancel` keeps the
-/// click away from the underlying chest slot.
-pub fn screen_mouse_button_pressed_pre(view: &ScreenView<'_>, button: i32) -> Flow {
+/// Client hook: page and cosmetic controls. The screen hook cannot send a
+/// payload, so it updates the local view and queues the request for
+/// `input::flush_pending_actions` from `key_mapping_pre`.
+pub fn screen_mouse_button_pressed_pre(uuid: u128, view: &ScreenView<'_>, button: i32) -> Flow {
     if !is_ours(view) || button != 0 {
         return Flow::Continue;
     }
-    let control = Layout::new(view.rect).hit(view.mouse);
+    let buttons = config::current().render.enable_button;
+    let control = Layout::new(view.rect).hit_with_buttons(view.mouse, buttons);
     match control {
         Control::PagePrev | Control::PageNext => {
-            with_state(Flow::Continue, |state| {
-                if state.advance(control == Control::PageNext) {
+            let next = control == Control::PageNext;
+            with_player(uuid, Flow::Continue, |menu| {
+                if menu.state.advance(next) {
                     Flow::Cancel
                 } else {
                     Flow::Continue
                 }
-            })
+            });
+            input::queue(if next {
+                input::PendingAction::PageNext
+            } else {
+                input::PendingAction::PagePrev
+            });
+            Flow::Cancel
         }
         Control::ToggleCosmetics => {
-            with_state(Flow::Continue, |state| {
-                state.toggle_cosmetic();
-                Flow::Cancel
-            })
+            with_player(uuid, (), |menu| menu.state.toggle_cosmetic());
+            input::queue(input::PendingAction::ToggleCosmetics);
+            Flow::Cancel
         }
-        // The screen hooks hold an immutable client host, so the request is
-        // sent from the key-mapping hook through input::send_render_toggle.
-        Control::ToggleRender => Flow::Cancel,
+        Control::ToggleRender => {
+            if let Some(slot) = hovered_render_slot(uuid) {
+                input::queue(input::PendingAction::ToggleRender(slot));
+            }
+            Flow::Cancel
+        }
         Control::Slot(_) | Control::None => Flow::Continue,
     }
 }
 
 /// Client hook: the wheel turns pages when the pointer is over our panel.
-pub fn screen_mouse_scrolled_pre(view: &ScreenView<'_>, scroll: [f64; 2]) -> Flow {
+pub fn screen_mouse_scrolled_pre(uuid: u128, view: &ScreenView<'_>, scroll: [f64; 2]) -> Flow {
     if !is_ours(view) || scroll[1] == 0.0 {
         return Flow::Continue;
     }
@@ -929,13 +998,16 @@ pub fn screen_mouse_scrolled_pre(view: &ScreenView<'_>, scroll: [f64; 2]) -> Flo
     if !matches!(control, Control::Slot(_)) {
         return Flow::Continue;
     }
-    with_state(Flow::Continue, |state| {
-        if state.advance(scroll[1] > 0.0) {
-            Flow::Cancel
-        } else {
-            Flow::Continue
-        }
-    })
+    let next = scroll[1] > 0.0;
+    with_player(uuid, (), |menu| {
+        menu.state.advance(next);
+    });
+    input::queue(if next {
+        input::PendingAction::PageNext
+    } else {
+        input::PendingAction::PagePrev
+    });
+    Flow::Cancel
 }
 
 /// The translatable title used by [`open`]. Kept as a translation key so the
@@ -1104,6 +1176,43 @@ mod tests {
         assert_eq!(state.page, 0);
         state.toggle_cosmetic();
         assert!(state.cosmetic);
+    }
+
+    #[test]
+    fn two_players_have_independent_menu_state() {
+        let first = 0x0000_0000_0000_0001_u128;
+        let second = 0x0000_0000_0000_0002_u128;
+        forget_player(first);
+        forget_player(second);
+        with_player(first, (), |menu| {
+            menu.state.page = 3;
+            menu.state.cosmetic = true;
+            menu.window = Some(41);
+        });
+        with_player(second, (), |menu| {
+            menu.state.page = 7;
+            menu.window = Some(42);
+        });
+        assert_eq!(player_state(first).page, 3);
+        assert!(player_state(first).cosmetic);
+        assert_eq!(player_window(first), Some(41));
+        assert_eq!(player_state(second).page, 7);
+        assert!(!player_state(second).cosmetic);
+        assert_eq!(player_window(second), Some(42));
+        forget_player(first);
+        assert_eq!(player_state(first).page, 0);
+        assert_eq!(player_state(second).page, 7);
+        assert_eq!(player_window(second), Some(42));
+        forget_player(second);
+    }
+
+    #[test]
+    fn button_hit_testing_honours_the_client_setting() {
+        let layout = layout();
+        let rect = layout.button_rect(Control::PageNext).unwrap();
+        let at = [rect[0] + 2.0, rect[1] + 2.0];
+        assert_eq!(layout.hit_with_buttons(at, true), Control::PageNext);
+        assert_ne!(layout.hit_with_buttons(at, false), Control::PageNext);
     }
 
     #[test]

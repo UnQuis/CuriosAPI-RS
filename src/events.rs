@@ -213,6 +213,24 @@ event_registry!(
     dispatch_drops
 );
 
+/// Production entry point for the death-drop batch: dispatches
+/// `CurioDropsEvent` and returns the drops a listener left in place.
+///
+/// A cancelled event returns no drops; the caller owns spawning them.
+pub fn dispatch_death_drops(entity: u32, drops: Vec<ItemSnapshot>) -> Vec<ItemSnapshot> {
+    let mut event = CurioDropsEvent {
+        entity,
+        drops,
+        cancelled: false,
+    };
+    dispatch_drops(&mut event);
+    if event.cancelled {
+        Vec::new()
+    } else {
+        event.drops
+    }
+}
+
 /// One `DropRulesEvent` override, applied by canonical item id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DropOverride {
@@ -343,6 +361,16 @@ mod tests {
         };
         dispatch_drops(&mut drops);
         assert!(drops.cancelled);
+    }
+
+    #[test]
+    fn death_drop_batch_can_be_cancelled_or_passed_through() {
+        register_drops(Arc::new(|event| event.cancelled = true)).unwrap();
+        let cancelled = dispatch_death_drops(7, Vec::new());
+        assert!(cancelled.is_empty());
+
+        let passed = dispatch_death_drops(7, Vec::new());
+        assert!(passed.is_empty());
     }
 
     #[test]
