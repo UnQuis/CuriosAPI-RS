@@ -30,6 +30,18 @@ pub const OPEN_REQUEST_VERSION: &str = "1";
 pub const RENDER_REQUEST_ID: &str = "curios:toggle_render";
 pub const RENDER_REQUEST_VERSION: &str = "1";
 
+/// Channel carrying the remaining client menu requests (Java `client_page`,
+/// `toggle_cosmetics`, `destroy`, `open_vanilla`).
+pub const MENU_REQUEST_ID: &str = "curios:menu_request";
+pub const MENU_REQUEST_VERSION: &str = "1";
+
+/// Action byte of the menu-request channel.
+pub const ACTION_PAGE_NEXT: u8 = 1;
+pub const ACTION_PAGE_PREV: u8 = 2;
+pub const ACTION_TOGGLE_COSMETICS: u8 = 3;
+pub const ACTION_DESTROY: u8 = 4;
+pub const ACTION_OPEN_VANILLA: u8 = 5;
+
 /// Payload contents: a single action byte. Kept explicit so a truncated or
 /// malformed packet is refused instead of being treated as an open.
 const OPEN_ACTION: u8 = 0b0000_0001;
@@ -174,6 +186,120 @@ pub fn render_handler() -> Arc<dyn IPayloadHandler> {
     Arc::new(RenderToggleHandler)
 }
 
+/// Encodes one menu action. The payload is action-only: the server keeps the
+/// window id of the menu it opened, so a stale client cannot target another
+/// player's menu.
+pub fn encode_menu_request(action: u8) -> PayloadBytes {
+    PayloadBytes(vec![action])
+}
+
+pub fn decode_menu_request(bytes: &PayloadBytes) -> Result<u8, PayloadHandleError> {
+    match bytes.0.as_slice() {
+        [action] if matches!(
+            *action,
+            ACTION_PAGE_NEXT
+                | ACTION_PAGE_PREV
+                | ACTION_TOGGLE_COSMETICS
+                | ACTION_DESTROY
+                | ACTION_OPEN_VANILLA
+        ) => Ok(*action),
+        _ => Err(PayloadHandleError::Failed(
+            "malformed curios menu request".to_owned(),
+        )),
+    }
+}
+
+pub fn menu_payload_id() -> PayloadId {
+    PayloadId(MENU_REQUEST_ID.to_owned())
+}
+
+pub fn menu_payload_declaration() -> PayloadDeclaration {
+    PayloadDeclaration::new(
+        menu_payload_id(),
+        MENU_REQUEST_VERSION.to_owned(),
+        PayloadProtocol::Play,
+        PayloadDirection::ToServer,
+        false,
+        HandlerThread::Main,
+    )
+}
+
+/// Client-side request helpers. Every one needs a mutable client host, which
+/// `key_mapping_pre` provides; the immutable screen hooks only update the
+/// local view and must not pretend to have changed the server.
+pub fn send_page(host: &mut dyn ClientHost, next: bool) -> bool {
+    let action = if next { ACTION_PAGE_NEXT } else { ACTION_PAGE_PREV };
+    host.send_payload_to_server(&menu_payload_id(), encode_menu_request(action))
+        .is_ok()
+}
+
+pub fn send_toggle_cosmetics(host: &mut dyn ClientHost) -> bool {
+    host.send_payload_to_server(
+        &menu_payload_id(),
+        encode_menu_request(ACTION_TOGGLE_COSMETICS),
+    )
+    .is_ok()
+}
+
+pub fn send_destroy(host: &mut dyn ClientHost) -> bool {
+    host.send_payload_to_server(&menu_payload_id(), encode_menu_request(ACTION_DESTROY))
+        .is_ok()
+}
+
+pub fn send_open_vanilla(host: &mut dyn ClientHost) -> bool {
+    host.send_payload_to_server(
+        &menu_payload_id(),
+        encode_menu_request(ACTION_OPEN_VANILLA),
+    )
+    .is_ok()
+}
+
+/// Server handler, registered by `lib.rs` in `Hooks::register`.
+pub struct MenuRequestHandler;
+
+impl IPayloadHandler for MenuRequestHandler {
+    fn handle(
+        &self,
+        payload: PayloadBytes,
+        context: &mut dyn IPayloadContext,
+    ) -> Result<(), PayloadHandleError> {
+        let action = decode_menu_request(&payload)?;
+        let player = context
+            .player()
+            .map_err(|error| PayloadHandleError::Failed(format!("{error:?}")))?;
+        let host = context
+            .server_host()
+            .map_err(|error| PayloadHandleError::Failed(format!("{error:?}")))?;
+        let uuid = player.uuid();
+        let accepted = match action {
+            ACTION_PAGE_NEXT => crate::menu::client_page(host, uuid, true),
+            ACTION_PAGE_PREV => crate::menu::client_page(host, uuid, false),
+            ACTION_TOGGLE_COSMETICS => crate::menu::toggle_cosmetics(host, uuid),
+            ACTION_DESTROY => crate::menu::destroy(host, uuid),
+            ACTION_OPEN_VANILLA => crate::menu::open_vanilla(host, uuid),
+            _ => false,
+        };
+        if !accepted {
+            eprintln!("[curios] menu request {action} refused for player {uuid}");
+        }
+        Ok(())
+    }
+}
+
+pub fn menu_handler() -> Arc<dyn IPayloadHandler> {
+    Arc::new(MenuRequestHandler)
+}
+
+/// Applies a server `grabbed_item` response on the client. The pinned API can
+/// only add the stack to the inventory; there is no cursor write from a
+/// client hook, so this is deliberately described as an inventory return.
+pub fn apply_grabbed_item(host: &mut dyn ClientHost, stack: &mod_api::ItemStack) -> bool {
+    if stack.count() == 0 {
+        return false;
+    }
+    host.give(stack.item(), stack.count()).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +327,25 @@ mod tests {
         assert!(decode_open_request(&PayloadBytes(Vec::new())).is_err());
         assert!(decode_open_request(&PayloadBytes(vec![0b0000_0010])).is_err());
         assert!(decode_open_request(&PayloadBytes(vec![OPEN_ACTION, 0])).is_err());
+    }
+
+    #[test]
+    fn menu_requests_are_strictly_decoded() {
+        for action in [
+            ACTION_PAGE_NEXT,
+            ACTION_PAGE_PREV,
+            ACTION_TOGGLE_COSMETICS,
+            ACTION_DESTROY,
+            ACTION_OPEN_VANILLA,
+        ] {
+            assert_eq!(decode_menu_request(&encode_menu_request(action)), Ok(action));
+        }
+        assert!(decode_menu_request(&PayloadBytes(Vec::new())).is_err());
+        assert!(decode_menu_request(&PayloadBytes(vec![0])).is_err());
+        assert!(decode_menu_request(&PayloadBytes(vec![ACTION_DESTROY, 0])).is_err());
+        let declaration = menu_payload_declaration();
+        assert_eq!(declaration.id, menu_payload_id());
+        assert_eq!(declaration.direction, PayloadDirection::ToServer);
     }
 
     #[test]

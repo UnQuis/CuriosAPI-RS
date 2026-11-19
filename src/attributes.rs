@@ -44,6 +44,27 @@ pub enum ModifierOperation {
     AddMultipliedTotal,
 }
 
+impl ModifierOperation {
+    /// Java serialized operation name, also used by the inventory codec.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AddValue => "add_value",
+            Self::AddMultipliedBase => "add_multiplied_base",
+            Self::AddMultipliedTotal => "add_multiplied_total",
+        }
+    }
+}
+
+/// Parses a serialized modifier operation for persistent slot-size modifiers.
+pub fn parse_modifier_operation(value: &str) -> Option<ModifierOperation> {
+    match value {
+        "add_value" => Some(ModifierOperation::AddValue),
+        "add_multiplied_base" => Some(ModifierOperation::AddMultipliedBase),
+        "add_multiplied_total" => Some(ModifierOperation::AddMultipliedTotal),
+        _ => None,
+    }
+}
+
 impl From<ModifierOperation> for AttributeOperation {
     fn from(value: ModifierOperation) -> Self {
         match value {

@@ -261,6 +261,48 @@ pub struct QuickMove {
     pub move_index: i32,
 }
 
+/// The receiving side of a serverbound request, for registration audits.
+pub fn client_request_kind(packet: &ClientPacket) -> &'static str {
+    match packet {
+        ClientPacket::Destroy => channel::DESTROY,
+        ClientPacket::OpenCurios { .. } => channel::OPEN_CURIOS,
+        ClientPacket::OpenVanilla { .. } => channel::OPEN_VANILLA,
+        ClientPacket::ClientPage { .. } => channel::CLIENT_PAGE,
+        ClientPacket::ToggleCosmetics { .. } => channel::TOGGLE_COSMETICS,
+        ClientPacket::ToggleRender { .. } => channel::TOGGLE_RENDER,
+    }
+}
+
+/// The receiving side of a clientbound packet, for registration audits.
+pub fn server_packet_kind(packet: &ServerPacket) -> &'static str {
+    match packet {
+        ServerPacket::SyncStack(_) => channel::SYNC_STACK,
+        ServerPacket::GrabbedItem(_) => channel::GRABBED_ITEM,
+        ServerPacket::SyncCurios(_) => channel::SYNC_CURIOS,
+        ServerPacket::SyncData(_) => channel::SYNC_DATA,
+        ServerPacket::SyncModifiers(_) => channel::SYNC_MODIFIERS,
+        ServerPacket::SyncRender(_) => channel::SYNC_RENDER,
+        ServerPacket::SyncActive(_) => channel::SYNC_ACTIVE,
+        ServerPacket::Break(_) => channel::BREAK,
+        ServerPacket::ServerPage(_) => channel::SERVER_PAGE,
+        ServerPacket::QuickMove(_) => channel::QUICK_MOVE,
+    }
+}
+
+/// Validates a client-supplied slot index against the server's own handler.
+/// A client never chooses which slot exists: only a number inside the
+/// authoritative inventory is accepted.
+fn slot_index(index: i32, len: usize) -> Result<usize, String> {
+    if index < 0 {
+        return Err(format!("slot index {index} is negative"));
+    }
+    let index = usize::try_from(index).map_err(|_| format!("slot index {index} is too large"))?;
+    if index >= len {
+        return Err(format!("slot index {index} is outside the {len} slots"));
+    }
+    Ok(index)
+}
+
 /// All serverbound requests.
 #[derive(Clone, Debug, PartialEq, mod_api::PayloadCodec)]
 pub enum ClientPacket {
@@ -913,8 +955,7 @@ pub fn handle_client(
             let handler = inventory
                 .slot_mut(&identifier)
                 .ok_or_else(|| format!("curios slot {identifier} is not equipped by {uuid}"))?;
-            let slot = usize::try_from(index)
-                .map_err(|_| format!("curios slot {identifier} has negative index {index}"))?;
+            let slot = slot_index(index, handler.len())?;
             let old = handler
                 .render(slot)
                 .ok_or_else(|| format!("curios slot {identifier} has no index {index}"))?;
@@ -957,8 +998,12 @@ pub fn handle_server(packet: ServerPacket) -> Result<(), String> {
             else {
                 return Err(format!("unknown curio id {}", value.curio_id));
             };
-            let index = usize::try_from(value.slot_id)
-                .map_err(|_| format!("slot id {} is not an index", value.slot_id))?;
+            let count = if value.handler_type == HANDLER_COSMETIC {
+                handler.cosmetic.len()
+            } else {
+                handler.stacks.len()
+            };
+            let index = slot_index(value.slot_id, count)?;
             let list = if value.handler_type == HANDLER_COSMETIC {
                 &mut handler.cosmetic
             } else {
@@ -987,8 +1032,7 @@ pub fn handle_server(packet: ServerPacket) -> Result<(), String> {
             else {
                 return Err(format!("unknown curio id {}", value.curio_id));
             };
-            let index = usize::try_from(value.slot_id)
-                .map_err(|_| format!("slot id {} is not an index", value.slot_id))?;
+            let index = slot_index(value.slot_id, handler.render.len())?;
             let slot = handler
                 .render
                 .get_mut(index)
@@ -1005,8 +1049,7 @@ pub fn handle_server(packet: ServerPacket) -> Result<(), String> {
             else {
                 return Err(format!("unknown curio id {}", value.curio_id));
             };
-            let index = usize::try_from(value.slot_id)
-                .map_err(|_| format!("slot id {} is not an index", value.slot_id))?;
+            let index = slot_index(value.slot_id, handler.active.len())?;
             let slot = handler
                 .active
                 .get_mut(index)
@@ -1121,6 +1164,91 @@ mod tests {
             assert!(names.insert(name), "duplicate channel {name}");
         }
         assert_eq!(names.len(), 16);
+    }
+
+    #[test]
+    fn every_channel_has_a_receiving_handler() {
+        let requests = [
+            ClientPacket::Destroy,
+            ClientPacket::OpenCurios { carried: None },
+            ClientPacket::OpenVanilla { carried: None },
+            ClientPacket::ClientPage {
+                window_id: 0,
+                next: true,
+            },
+            ClientPacket::ToggleCosmetics { window_id: 0 },
+            ClientPacket::ToggleRender {
+                identifier: "ring".to_owned(),
+                index: 0,
+            },
+        ];
+        let updates = [
+            ServerPacket::SyncStack(SyncStack {
+                entity_id: 1,
+                curio_id: "ring".to_owned(),
+                slot_id: 0,
+                stack: None,
+                handler_type: HANDLER_EQUIPMENT,
+                compound_tag: NetTag::Compound(Vec::new()),
+            }),
+            ServerPacket::GrabbedItem(GrabbedItem { stack: None }),
+            ServerPacket::SyncCurios(SyncCurios {
+                entity_id: 1,
+                handlers: Vec::new(),
+            }),
+            ServerPacket::SyncData(SyncData {
+                declarations: Vec::new(),
+            }),
+            ServerPacket::SyncModifiers(SyncModifiers {
+                entity_id: 1,
+                modifiers: Vec::new(),
+            }),
+            ServerPacket::SyncRender(SyncRender {
+                entity_id: 1,
+                curio_id: "ring".to_owned(),
+                slot_id: 0,
+                value: true,
+            }),
+            ServerPacket::SyncActive(SyncActive {
+                entity_id: 1,
+                curio_id: "ring".to_owned(),
+                slot_id: 0,
+                value: true,
+            }),
+            ServerPacket::Break(Break {
+                entity_id: 1,
+                curio_id: "ring".to_owned(),
+                slot_id: 0,
+            }),
+            ServerPacket::ServerPage(ServerPage {
+                window_id: 0,
+                page: 0,
+            }),
+            ServerPacket::QuickMove(QuickMove {
+                window_id: 0,
+                move_index: 1,
+            }),
+        ];
+        let mut handled = std::collections::BTreeSet::new();
+        for request in &requests {
+            handled.insert(client_request_kind(request));
+        }
+        for update in &updates {
+            handled.insert(server_packet_kind(update));
+        }
+        assert_eq!(handled.len(), 16);
+        for name in channel::ALL {
+            assert!(handled.contains(name), "channel {name} has no handler");
+        }
+    }
+
+    #[test]
+    fn client_supplied_slot_indices_are_validated() {
+        assert_eq!(slot_index(0, 3), Ok(0));
+        assert_eq!(slot_index(2, 3), Ok(2));
+        assert!(slot_index(-1, 3).is_err());
+        assert!(slot_index(3, 3).is_err());
+        assert!(slot_index(9, 3).is_err());
     }
 
     #[test]

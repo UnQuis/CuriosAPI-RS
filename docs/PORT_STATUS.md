@@ -4,45 +4,46 @@ All work is integrated through pull request #1 on `port/horizon-core`.
 
 ## Wave 1 — complete
 
-| Area | State | Files |
+Slot model, inventory, item API, equip/drop decisions, Horizon place bridge,
+network transport, commands, GUI, rendering, attributes, events, data packs and
+item effects. See the PR description for the full list.
+
+## Wave 2 — complete
+
+| Area | Files | Result |
 |---|---|---|
-| Research: Horizon API / Curios behavior | done | `docs/research/*.md` |
-| Slot model + 11 bundled definitions | done | `src/slots.rs`, `src/registry.rs`, `data/curios/...` |
-| Per-entity inventory + persistence + client mirror | done | `src/inventory.rs` |
-| Item-side behavior API + public facade | done | `src/curio.rs`, `src/api.rs` |
-| Equip / drop decisions + event surface | done | `src/equip.rs`, `src/drop.rs`, `src/events.rs` |
-| Horizon place bridge + death drops | done | `src/place.rs`, `src/lib.rs` |
-| Networking (16 typed payload channels) + commands | done | `src/net.rs`, `src/commands.rs` |
-| GUI, keybinds, localization, assets | done | `src/menu.rs`, `src/input.rs`, `src/lang.rs`, `assets/` |
-| Entity rendering (11 layers, cosmetics priority) | done | `src/render.rs` |
-| Attribute modifiers + dynamic slot sizes | done | `src/attributes.rs` |
-| Data-pack slot registry + hot reload | done | `src/datapack.rs` |
-| Item effects (enderman, piglin, powder snow, fortune/looting helpers) | done | `src/effects.rs` |
-| Config | done | `src/config.rs`, `src/lib.rs` |
+| Full Java command set (`list/set/add/remove/clear/replace`) + 16-channel payload audit | `src/commands.rs`, `src/net.rs` | done |
+| GUI controls, tooltips, 19 locales, slot icons | `src/menu.rs`, `src/input.rs`, `src/lang.rs`, `assets/` | done |
+| `ItemPart` for piglin neutrality, break animation, tooltips | `src/itempart.rs` | done |
+| Equip-time validation, change events, behavior callbacks, dynamic slot sizes | `src/place.rs`, `src/equip.rs`, `src/events.rs`, `src/attributes.rs`, `src/inventory.rs` | done |
+| Effect helpers (Fortune/Looting, Mending observe, cached wearer effects) | `src/effects.rs` | done |
+| SDK/game pin updated to `dd67b76…` | `horizon-mod.toml`, `compatibility.json`, `Cargo.lock` | done |
 
-## Known Horizon limitations (documented in module docs)
+### Runtime wiring added in wave 2
 
-- No mod-slot equip/unequip hook: equip moments are computed through the
-  attachment and `ItemPlace::Mod`; listeners observe through our event registry.
-- No arbitrary `EquipmentSlotGroup`: Curio attribute modifiers are gated behind
-  `curios:attribute_modifiers` and installed for the `any` group.
+`PlaceProvider::insert/extract` now run `equip::can_equip` / `can_unequip`
+server-side before mutating, dispatch `CurioChangeEvent` and
+`SlotModifiersUpdatedEvent`, call `CurioBehavior::on_equip/on_unequip`, and send a
+point-to-point `sync_stack`. Slot sizes are recalculated through
+`SlotSizeState::resize` on data reload; removed stacks go to `invalid` and are
+dropped on the next tick.
+
+## Remaining Horizon limitations
+
+- No native mod-slot equip hook; moments are computed in our own attachment/
+  place bridge and exposed through our event registry.
+- No arbitrary `EquipmentSlotGroup`: Curio modifiers are gated behind the
+  `curios:attribute_modifiers` component and installed for the `any` group.
 - No real slots in a custom screen: the GUI mirrors stacks into a vanilla
   `minecraft:generic_9x6` menu; custom graphics are drawn in screen hooks.
-- `player_item_mend` is observe-only in Horizon, so Mending cannot be injected.
-- Break-animation suppression and piglin neutrality are `ItemPart` hooks; the
-  helpers exist in `src/effects.rs` but need an `ItemPart` attached at registration.
+- `player_item_mend` is observe-only, so a Curio Mending bonus is reported but
+  cannot be injected.
+- `get_enchantment_level` receives a stack without its wearer, so the prepared
+  `effects::get_enchantment_level` helper is not wired into a global hook yet.
 
 ## Verification
 
-- `cargo test --offline`: **81 passed, 0 failed**.
+- `cargo test --offline`: **98 passed, 0 failed**.
 - `git diff --check`: clean.
-- `horizon-launcher native-build`: unverified. The mod pins Horizon
-  `4dc6455d…` (matching the sibling `ProjectE-RS` port); the launcher offers no
-  game build for that revision, and the prepared `nightly-2026-11-18-dd67b76`
-  refuses packages made by the older mod tools. Cargo compiles against the
-  pinned generated SDK.
-
-## Percent complete
-
-Approximately **95% of the intended first-wave scope**. Remaining ~5% is the
-small set of Horizon-impossible behaviors listed above plus in-game verification.
+- `horizon-launcher native-build --version nightly-2026-11-18-dd67b76 .`:
+  **success** — native mod `native-dd67b76-36a75a36398d` built and installed.

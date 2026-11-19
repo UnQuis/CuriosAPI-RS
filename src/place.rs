@@ -8,8 +8,13 @@
 
 use mod_api::{Holder, ItemPlace, ItemResource, PlaceProvider, ServerHost};
 
+use crate::curio::{self, CurioContext};
+use crate::equip::{self, TriState};
+use crate::events::{self, ChangeKind, CurioChangeEvent, SlotModifiersUpdatedEvent};
 use crate::inventory::{CurioInventory, INVENTORY, InventoryError, ItemSnapshot};
+use crate::net::{self, NetTag};
 use crate::registry;
+use crate::slots::{SlotContext, SlotType};
 
 /// Registered name of the mod place provider (`ItemPlace::Mod.provider`).
 pub const PROVIDER: &str = "curios:slots";
@@ -65,6 +70,104 @@ pub fn cosmetic_place(entity: u32, slot_type: &str, slot: u16) -> Option<ItemPla
 
 fn report(error: &InventoryError) {
     eprintln!("[curios] place operation refused: {error:?}");
+}
+
+/// Resolves the slot type and `SlotContext` addressed by a place key.
+fn context_for(key: u64) -> Option<(u32, SlotType, SlotContext)> {
+    let (entity, type_index, raw_slot) = parse_key(key);
+    let slot_type = registry::slot_type_at(type_index)?;
+    let context = SlotContext::new(
+        slot_type.id(),
+        Some(u64::from(entity)),
+        usize::from(raw_slot & SLOT_MASK),
+        is_cosmetic(key),
+        true,
+    );
+    Some((entity, slot_type, context))
+}
+
+/// Player uuid for a targeted stack sync; non-player entities get no packet.
+fn player_uuid(host: &mut dyn ServerHost, entity: u32) -> Option<u128> {
+    host.players()
+        .server_players()
+        .into_iter()
+        .find(|player| player.entity().id() == entity)
+        .map(|player| player.uuid())
+}
+
+/// Dispatches change/modifier events, item behavior hooks and the targeted
+/// `sync_stack` packet after a successful server-side write.
+fn notify_change(
+    host: &mut dyn ServerHost,
+    entity: u32,
+    slot_type: &SlotType,
+    index: usize,
+    cosmetic: bool,
+    previous: Option<ItemSnapshot>,
+    current: Option<ItemSnapshot>,
+    kind: ChangeKind,
+) {
+    let previous_id = previous.as_ref().and_then(ItemSnapshot::item_id);
+    let current_id = current.as_ref().and_then(ItemSnapshot::item_id);
+    let mut change = CurioChangeEvent {
+        entity,
+        slot: slot_type.id().to_owned(),
+        index,
+        previous,
+        current,
+        kind,
+    };
+    events::dispatch_change(&mut change);
+
+    let behavior_id = current_id.clone().or_else(|| previous_id.clone());
+    if let Some(item) = behavior_id {
+        if let Some(behavior) = curio::behavior(&item) {
+            let context = CurioContext {
+                slot: slot_type.id(),
+                index: index as u32,
+                item: &item,
+            };
+            if kind == ChangeKind::Item {
+                if current_id.is_some() && previous_id.as_deref() != Some(item.as_str()) {
+                    behavior.on_equip(&context);
+                } else if current_id.is_none() {
+                    behavior.on_unequip(&context);
+                }
+            }
+        }
+    }
+
+    events::dispatch_slot_modifiers_updated(&mut SlotModifiersUpdatedEvent {
+        entity,
+        slots: vec![slot_type.id().to_owned()],
+    });
+
+    let Some(uuid) = player_uuid(host, entity) else {
+        return;
+    };
+    let handler_type = if cosmetic {
+        net::HANDLER_COSMETIC
+    } else {
+        net::HANDLER_EQUIPMENT
+    };
+    if let Err(error) = net::sync_stack(
+        host,
+        uuid,
+        slot_type.id(),
+        index as i32,
+        change.current.as_ref(),
+        handler_type,
+        &NetTag::Compound(Vec::new()),
+    ) {
+        eprintln!("[curios] stack sync failed for {}: {error:?}", slot_type.id());
+    }
+}
+
+fn snapshot_of(
+    host: &dyn ServerHost,
+    stack: Option<&mod_api::ItemStack>,
+) -> Result<Option<ItemSnapshot>, InventoryError> {
+    stack.map(|stack| ItemSnapshot::from_stack(host, stack)).transpose()
 }
 
 /// Reads one stored stack through the host's canonical item ids.
@@ -134,6 +237,14 @@ impl PlaceProvider for CurioPlaceProvider {
         resource: &ItemResource,
         amount: u32,
     ) -> u32 {
+        let Some((entity, slot_type, context)) = context_for(key) else {
+            eprintln!("[curios] insert refused: place key {key} has no slot type");
+            return 0;
+        };
+        let item_id = resource.item().id(host);
+        if !equip::can_equip(&slot_type, &context, &item_id, TriState::Default) {
+            return 0;
+        }
         let existing = match read_stack(host, key) {
             Ok(stack) => stack,
             Err(error) => {
@@ -144,6 +255,13 @@ impl PlaceProvider for CurioPlaceProvider {
         if existing.as_ref().is_some_and(|stack| !resource.matches(stack)) {
             return 0;
         }
+        let previous = match snapshot_of(host, existing.as_ref()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                report(&error);
+                return 0;
+            }
+        };
         let limit = host.max_stack_size(resource.item()).unwrap_or(64);
         let current = existing.as_ref().map_or(0, mod_api::ItemStack::count);
         let room = limit.saturating_sub(current);
@@ -155,8 +273,34 @@ impl PlaceProvider for CurioPlaceProvider {
             eprintln!("[curios] insert refused: stack count {current}+{taken} is invalid");
             return 0;
         };
+        let current = match snapshot_of(host, Some(&next)) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                report(&error);
+                return 0;
+            }
+        };
+        let previous_id = previous.as_ref().and_then(ItemSnapshot::item_id);
+        let current_id = current.as_ref().and_then(ItemSnapshot::item_id);
+        let kind = if previous_id == current_id {
+            ChangeKind::State
+        } else {
+            ChangeKind::Item
+        };
         match write_stack(host, key, Some(&next)) {
-            Ok(()) => taken,
+            Ok(()) => {
+                notify_change(
+                    host,
+                    entity,
+                    &slot_type,
+                    usize::from(context.index),
+                    is_cosmetic(key),
+                    previous,
+                    current,
+                    kind,
+                );
+                taken
+            }
             Err(error) => {
                 report(&error);
                 0
@@ -172,15 +316,32 @@ impl PlaceProvider for CurioPlaceProvider {
         resource: &ItemResource,
         amount: u32,
     ) -> u32 {
+        let Some((entity, slot_type, context)) = context_for(key) else {
+            eprintln!("[curios] extract refused: place key {key} has no slot type");
+            return 0;
+        };
         let Some(existing) = read_stack(host, key).unwrap_or_else(|error| {
             report(&error);
             None
         }) else {
             return 0;
         };
+        let previous_id = existing.item().id(host);
+        if !equip::can_unequip(&context, &previous_id, TriState::Default) {
+            return 0;
+        }
         if !resource.matches(&existing) {
             return 0;
         }
+        let previous = match snapshot_of(host, Some(&existing)) {
+            Ok(snapshot) => snapshot.unwrap_or_else(|| {
+                unreachable!("a stack was read from this slot")
+            }),
+            Err(error) => {
+                report(&error);
+                return 0;
+            }
+        };
         let took = amount.min(existing.count());
         if took == 0 {
             return 0;
@@ -195,8 +356,33 @@ impl PlaceProvider for CurioPlaceProvider {
             }
             Some(stack)
         };
+        let current = match snapshot_of(host, next.as_ref()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                report(&error);
+                return 0;
+            }
+        };
+        let current_id = current.as_ref().and_then(ItemSnapshot::item_id);
+        let kind = if Some(previous_id.as_str()) == current_id.as_deref() {
+            ChangeKind::State
+        } else {
+            ChangeKind::Item
+        };
         match write_stack(host, key, next.as_ref()) {
-            Ok(()) => took,
+            Ok(()) => {
+                notify_change(
+                    host,
+                    entity,
+                    &slot_type,
+                    context.index,
+                    is_cosmetic(key),
+                    Some(previous),
+                    current,
+                    kind,
+                );
+                took
+            }
             Err(error) => {
                 report(&error);
                 0

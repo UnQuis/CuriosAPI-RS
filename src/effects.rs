@@ -267,6 +267,22 @@ pub fn add_enchantment_bonus(enchantments: &mut ItemEnchantments, effects: &Curi
     }
 }
 
+/// `Hooks::get_enchantment_level` entry point.
+///
+/// Horizon's event carries only the stack, not its wearer, so the caller must
+/// pass the entity id whose effects were captured by [`refresh_effects`].
+pub fn get_enchantment_level(event: &mut GetEnchantmentLevelEvent<'_>, entity_id: u32) {
+    apply_enchantment_bonus(event, &cached_effects(entity_id));
+}
+
+/// Variant for callers that already resolved the wearer's effects.
+pub fn get_enchantment_level_with(
+    event: &mut GetEnchantmentLevelEvent<'_>,
+    effects: &CurioEffects,
+) {
+    apply_enchantment_bonus(event, effects);
+}
+
 /// Intended Mending bonus; Horizon's `player_item_mend` cannot inject it.
 pub const fn mending_bonus(effects: &CurioEffects) -> u32 {
     effects.mending_bonus
@@ -278,6 +294,13 @@ pub fn describe_mend(event: &PlayerItemMendEvent<'_>) -> String {
         "player {} mended {} with {} experience (repair {})",
         event.player, event.item, event.experience, event.repair
     )
+}
+
+/// `Hooks::player_item_mend` entry point: logs the event. Horizon exposes the
+/// repair and experience amounts as inputs, so a Curio Mending bonus cannot be
+/// applied here.
+pub fn player_item_mend(event: &mut PlayerItemMendEvent<'_>) {
+    eprintln!("[curios] {}", describe_mend(event));
 }
 
 /// `ItemPart::should_cause_reequip_animation` helper: suppress the animation

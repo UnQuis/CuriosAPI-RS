@@ -14,6 +14,7 @@ use std::str::FromStr;
 
 use mod_api::{AttachmentCodec, AttachmentError, AttachmentType, Compound, Host, ItemStack, Tag};
 
+use crate::attributes::{SlotSizeModifier, SlotSizeState, parse_modifier_operation};
 use crate::drop::{DropRule, DropRules, ItemPredicate, decide_drop};
 use crate::registry;
 use crate::slots::{SlotType, validate_slot_id};
@@ -51,7 +52,7 @@ impl ItemSnapshot {
 }
 
 /// One slot type's stacks, mirrored cosmetic slots and per-slot flags.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SlotStacks {
     stacks: Vec<Option<ItemSnapshot>>,
     cosmetic: Vec<Option<ItemSnapshot>>,
@@ -59,6 +60,10 @@ pub struct SlotStacks {
     active: Vec<bool>,
     drop_rule: DropRule,
     use_native_gui: bool,
+    /// Default size before slot modifiers, from the slot definition.
+    base_size: u32,
+    /// Slot-size modifiers and their lifetime; preserved across data reloads.
+    modifiers: Vec<(SlotSizeModifier, bool)>,
 }
 
 impl SlotStacks {
@@ -76,7 +81,69 @@ impl SlotStacks {
             active: vec![true; len],
             drop_rule: slot.drop_rule(),
             use_native_gui: slot.use_native_gui(),
+            base_size: u32::try_from(slot.size()).unwrap_or(0),
+            modifiers: Vec::new(),
         }
+    }
+
+    /// The Java `CurioStacksHandler` size state computed from this handler.
+    pub fn size_state(&self) -> SlotSizeState {
+        SlotSizeState {
+            base: self.base_size,
+            modifiers: self.modifiers.clone(),
+        }
+    }
+
+    /// Replaces the slot-size modifiers. Call [`Self::resize_to`] afterwards to
+    /// apply the resulting size to the stored stacks.
+    pub fn set_size_modifiers(&mut self, modifiers: Vec<(SlotSizeModifier, bool)>) {
+        self.modifiers = modifiers;
+    }
+
+    /// The lifetime-tagged slot-size modifiers.
+    pub fn size_modifiers(&self) -> &[(SlotSizeModifier, bool)] {
+        &self.modifiers
+    }
+
+    /// Rebuilds all four parallel vectors to `target`, copying what fits from
+    /// `old` and returning stacks that no longer fit as invalid.
+    fn adopt_from(&mut self, old: &Self, target: usize) -> Vec<ItemSnapshot> {
+        let has_cosmetic = !self.cosmetic.is_empty() || !old.cosmetic.is_empty();
+        self.stacks = (0..target)
+            .map(|index| old.stacks.get(index).cloned().flatten())
+            .collect();
+        self.cosmetic = if has_cosmetic {
+            (0..target)
+                .map(|index| old.cosmetic.get(index).cloned().flatten())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.render = (0..target)
+            .map(|index| old.render.get(index).copied().unwrap_or(true))
+            .collect();
+        self.active = (0..target)
+            .map(|index| old.active.get(index).copied().unwrap_or(true))
+            .collect();
+
+        let mut invalid = Vec::new();
+        for index in target..old.stacks.len() {
+            if let Some(item) = old.stacks[index].clone() {
+                invalid.push(item);
+            }
+        }
+        for index in target..old.cosmetic.len() {
+            if let Some(item) = old.cosmetic[index].clone() {
+                invalid.push(item);
+            }
+        }
+        invalid
+    }
+
+    /// Applies a new slot count directly, returning items in the dropped tail.
+    pub fn resize_to(&mut self, target: usize) -> Vec<ItemSnapshot> {
+        let old = self.clone();
+        self.adopt_from(&old, target)
     }
 
     /// Number of functional slots.
@@ -223,7 +290,7 @@ impl SlotStacks {
 }
 
 /// All curio slots of one living entity, persisted as an attachment.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CurioInventory {
     slots: BTreeMap<String, SlotStacks>,
     invalid: Vec<ItemSnapshot>,
@@ -247,32 +314,30 @@ impl CurioInventory {
     pub fn reload(&mut self, types: &[SlotType]) -> Vec<ItemSnapshot> {
         let fresh = Self::from_slot_types(types);
         let mut invalid = Vec::new();
+        let mut rebuilt = BTreeMap::new();
         for (id, handler) in fresh.slots {
             match self.slots.remove(&id) {
                 Some(old) => {
                     let mut kept = handler;
-                    kept.carry_flags_from(&old);
-                    for index in 0..kept.len().min(old.len()) {
-                        if let Some(item) = old.stacks[index].clone() {
-                            match kept.set_stack(index, Some(item)) {
-                                Ok(_) => {}
-                                Err(_) => unreachable!("index was checked against kept.len()"),
-                            }
-                        }
-                    }
-                    self.slots.insert(id, kept);
+                    // Keep both transient and permanent modifiers so the
+                    // dynamic slot count survives a data-pack reload.
+                    kept.modifiers = old.modifiers.clone();
+                    let target =
+                        usize::try_from(kept.size_state().resize().size).unwrap_or(0);
+                    invalid.extend(kept.adopt_from(&old, target));
+                    rebuilt.insert(id, kept);
                 }
                 None => {
-                    self.slots.insert(id, handler);
+                    rebuilt.insert(id, handler);
                 }
             }
         }
-        // Slot types that were removed keep no handler; their stacks are invalid.
+        // Only removed slot types remain here; their stacks are invalid.
         for old in self.slots.values() {
             invalid.extend(old.stacks.iter().flatten().cloned());
             invalid.extend(old.cosmetic.iter().flatten().cloned());
         }
-        self.slots.retain(|id, _| types.iter().any(|slot| slot.id() == id));
+        self.slots = rebuilt;
         invalid.extend(std::mem::take(&mut self.invalid));
         invalid
     }
@@ -372,6 +437,60 @@ fn read_flags(value: Option<&Tag>, len: usize) -> Result<Vec<bool>, AttachmentEr
         .collect()
 }
 
+fn encode_modifiers(modifiers: &[(SlotSizeModifier, bool)]) -> Tag {
+    Tag::List(
+        modifiers
+            .iter()
+            .map(|(modifier, permanent)| {
+                Tag::compound([
+                    ("operation", Tag::String(modifier.operation.as_str().into())),
+                    ("amount", Tag::Double(modifier.amount.to_bits())),
+                    ("permanent", Tag::Byte(i8::from(*permanent))),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn decode_modifiers(value: Option<&Tag>) -> Result<Vec<(SlotSizeModifier, bool)>, AttachmentError> {
+    let Tag::List(list) = value.ok_or(AttachmentError::Decode)? else {
+        return Err(AttachmentError::Decode);
+    };
+    list.iter()
+        .map(|tag| {
+            let Tag::Compound(map) = tag else {
+                return Err(AttachmentError::Decode);
+            };
+            let Tag::String(operation) =
+                map.get(&"operation".into()).ok_or(AttachmentError::Decode)?
+            else {
+                return Err(AttachmentError::Decode);
+            };
+            let operation = parse_modifier_operation(&operation.to_string_lossy())
+                .ok_or(AttachmentError::Decode)?;
+            let Tag::Double(bits) = map.get(&"amount".into()).ok_or(AttachmentError::Decode)?
+            else {
+                return Err(AttachmentError::Decode);
+            };
+            let Tag::Byte(permanent) =
+                map.get(&"permanent".into()).ok_or(AttachmentError::Decode)?
+            else {
+                return Err(AttachmentError::Decode);
+            };
+            if *permanent != 0 && *permanent != 1 {
+                return Err(AttachmentError::Decode);
+            }
+            Ok((
+                SlotSizeModifier {
+                    operation,
+                    amount: f64::from_bits(*bits),
+                },
+                *permanent == 1,
+            ))
+        })
+        .collect()
+}
+
 fn encode_handler(handler: &SlotStacks) -> Compound {
     let mut out = Compound::new();
     out.insert("stacks".into(), Tag::List(strings(&handler.stacks)));
@@ -392,6 +511,11 @@ fn encode_handler(handler: &SlotStacks) -> Compound {
         "use_native_gui".into(),
         Tag::Byte(i8::from(handler.use_native_gui)),
     );
+    out.insert(
+        "base_size".into(),
+        Tag::Int(i32::try_from(handler.base_size).unwrap_or(i32::MAX)),
+    );
+    out.insert("modifiers".into(), encode_modifiers(&handler.modifiers));
     out
 }
 
@@ -415,6 +539,12 @@ fn decode_handler(value: &Tag) -> Result<SlotStacks, AttachmentError> {
     if *native != 0 && *native != 1 {
         return Err(AttachmentError::Decode);
     }
+    let Tag::Int(base_size) = map.get(&"base_size".into()).ok_or(AttachmentError::Decode)?
+    else {
+        return Err(AttachmentError::Decode);
+    };
+    let base_size = u32::try_from(*base_size).map_err(|_| AttachmentError::Decode)?;
+    let modifiers = decode_modifiers(map.get(&"modifiers".into()))?;
     Ok(SlotStacks {
         stacks,
         cosmetic,
@@ -422,6 +552,8 @@ fn decode_handler(value: &Tag) -> Result<SlotStacks, AttachmentError> {
         active,
         drop_rule,
         use_native_gui: *native == 1,
+        base_size,
+        modifiers,
     })
 }
 
@@ -534,6 +666,61 @@ mod tests {
             handler.set_stack(2, None),
             Err(InventoryError::IndexOutOfBounds { index: 2, len: 2 })
         ));
+    }
+
+    #[test]
+    fn slot_size_modifiers_round_trip_and_apply_on_reload() {
+        use crate::attributes::ModifierOperation;
+
+        let mut inventory = CurioInventory::from_slot_types(&[slot()]);
+        let handler = inventory.slot_mut("ring").unwrap();
+        handler
+            .set_stack(1, Some(snapshot("minecraft:stone")))
+            .unwrap();
+        handler.set_size_modifiers(vec![(
+            SlotSizeModifier {
+                operation: ModifierOperation::AddValue,
+                amount: 2.0,
+            },
+            true,
+        )]);
+
+        let encoded = encode_inventory(&inventory).unwrap();
+        let decoded = decode_inventory(&encoded).unwrap();
+        assert_eq!(inventory, decoded);
+
+        let types = [slot()];
+        let mut reloaded = decoded;
+        let invalid = reloaded.reload(&types);
+        assert!(invalid.is_empty());
+        assert_eq!(reloaded.slot("ring").unwrap().len(), 4);
+        assert_eq!(reloaded.slot("ring").unwrap().size_modifiers().len(), 1);
+        assert_eq!(
+            reloaded.slot("ring").unwrap().stack(1),
+            Some(&Some(snapshot("minecraft:stone")))
+        );
+    }
+
+    #[test]
+    fn shrinking_slot_size_reports_invalid_tail() {
+        use crate::attributes::ModifierOperation;
+
+        let mut handler = SlotStacks::new(&slot());
+        handler
+            .set_stack(1, Some(snapshot("minecraft:stone")))
+            .unwrap();
+        handler.set_size_modifiers(vec![(
+            SlotSizeModifier {
+                operation: ModifierOperation::AddValue,
+                amount: -1.0,
+            },
+            false,
+        )]);
+        let target = handler.size_state().resize().size as usize;
+        let invalid = handler.resize_to(target);
+        assert_eq!(target, 1);
+        assert_eq!(invalid, vec![snapshot("minecraft:stone")]);
+        assert!(handler.stack(1).is_none());
     }
 
     #[test]

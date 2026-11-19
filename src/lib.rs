@@ -23,6 +23,7 @@ pub mod equip;
 pub mod events;
 pub mod input;
 pub mod inventory;
+pub mod itempart;
 pub mod lang;
 pub mod menu;
 pub mod net;
@@ -34,6 +35,9 @@ pub mod slots;
 /// Key that toggles rendering of the hovered Curio slot in the open menu.
 const RENDER_KEY_ID: &str = "key.curios.toggle_render";
 const RENDER_KEY_DEFAULT: &str = "R";
+const PAGE_NEXT_KEY: &str = "key.curios.page_next";
+const PAGE_PREV_KEY: &str = "key.curios.page_prev";
+const COSMETICS_KEY: &str = "key.curios.toggle_cosmetics";
 
 #[derive(Default)]
 struct Curios;
@@ -61,6 +65,23 @@ impl Hooks for Curios {
             Some(input::render_handler()),
             None,
         );
+        r.add_payload(
+            input::menu_payload_declaration(),
+            Some(input::menu_handler()),
+            None,
+        );
+        for (id, default) in [
+            (PAGE_NEXT_KEY, "]"),
+            (PAGE_PREV_KEY, "["),
+            (COSMETICS_KEY, "C"),
+        ] {
+            r.register_key_mapping(
+                KeyRegistration::new(id, default)
+                    .label(id)
+                    .context(KeyConflictContext::Universal),
+            );
+        }
+        itempart::register(r);
         render::register(r);
         if let Err(error) = datapack::declare(r) {
             eprintln!("[curios] slot-type registry declaration failed: {error:?}");
@@ -146,6 +167,10 @@ impl Hooks for Curios {
 
     fn enderman_anger(&self, host: &dyn Host, event: &mut EndermanAngerEvent) -> Flow {
         effects::enderman_anger(host, event)
+    }
+
+    fn player_item_mend(&self, _host: &mut dyn ServerHost, event: &mut PlayerItemMendEvent<'_>) {
+        effects::player_item_mend(event);
     }
 
     fn living_breathe(&self, _context: &dyn LoopContext, event: &mut LivingBreatheEvent<'_>) {
@@ -264,11 +289,17 @@ impl Hooks for Curios {
         if input::on_mapping_press(host, event.mapping, event.pressed) {
             return Flow::Cancel;
         }
-        if event.mapping == RENDER_KEY_ID && event.pressed {
-            if let Some(slot) = menu::hovered_render_slot() {
-                if input::send_render_toggle(host, slot) {
-                    return Flow::Cancel;
-                }
+        if event.pressed {
+            let handled = match event.mapping {
+                RENDER_KEY_ID => menu::hovered_render_slot()
+                    .is_some_and(|slot| input::send_render_toggle(host, slot)),
+                PAGE_NEXT_KEY => input::send_page(host, true),
+                PAGE_PREV_KEY => input::send_page(host, false),
+                COSMETICS_KEY => input::send_toggle_cosmetics(host),
+                _ => false,
+            };
+            if handled {
+                return Flow::Cancel;
             }
         }
         Flow::Continue
