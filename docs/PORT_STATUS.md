@@ -67,11 +67,13 @@ Second review found three remaining critical issues, all fixed:
   while keeping the qualified id as the map key, so all 11 entries decode and
   `/curios reload` no longer retries forever.
 
-Meta finding D is also addressed: `src/review_regressions.rs` now calls real
-production functions (`is_stack_valid_host`, `handle_server`,
-`mark_pending/take_pending`, `CurioPlaceProvider::insert`, `decode_entries`,
-`inventory_slot_for_menu_slot`) instead of local copies. The two minor tails
-(#9 command modifiers, #23 conditional modifier events) are fixed as well.
+Meta finding D is addressed **partially**: `src/review_regressions.rs` now calls
+real production functions (`is_stack_valid_host`, `handle_server`,
+`mark_pending/take_pending`, `decode_entries`, `inventory_slot_for_menu_slot`),
+but two tests still use an injected predicate and the menu-click test checks
+pure helpers rather than `menu_clicked` itself — full production-path coverage
+is not claimed. The minor tails (#9 command modifiers, #23 conditional modifier
+events) are fixed as well.
 
 `mod_api` test mocks are enabled through a dev-dependency feature, so they stay
 out of the shipped native build.
