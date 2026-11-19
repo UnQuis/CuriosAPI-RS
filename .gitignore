@@ -1,0 +1,6 @@
+/target/
+/.horizon/
+/logs/
+/config/
+/world/
+*.log
