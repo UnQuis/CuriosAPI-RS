@@ -67,7 +67,9 @@ pub fn can_equip(
                     item: item_id,
                 })
         });
-    event.apply(original)
+    let mut dispatched = crate::events::CurioCanEquipEvent::new(item_id, context.clone(), original);
+    let result = crate::events::can_equip_override(&mut dispatched);
+    event.apply(result.apply(original))
 }
 
 /// Server-authoritative `canUnequip`, including an external override.
@@ -79,7 +81,10 @@ pub fn can_unequip(context: &SlotContext, item_id: &str, event: TriState) -> boo
             item: item_id,
         })
     });
-    event.apply(original)
+    let mut dispatched =
+        crate::events::CurioCanUnequipEvent::new(item_id, context.clone(), original);
+    let result = crate::events::can_unequip_override(&mut dispatched);
+    event.apply(result.apply(original))
 }
 
 /// Resolves the death-drop outcome for one stored item.
@@ -103,6 +108,29 @@ where
         item_rule,
         slot_rule,
         !config::drops_on_death(),
+        drop_prevented,
+    )
+}
+
+/// Same as [`decide_death_drop`] but first dispatches `DropRulesEvent` to
+/// registered listeners, honoring the last matching override.
+pub fn decide_death_drop_with_events(
+    entity: u32,
+    item: &ItemSnapshot,
+    item_rule: drop::DropRule,
+    slot_rule: drop::DropRule,
+    drop_prevented: bool,
+) -> DropDecision {
+    let mut event = crate::events::DropRulesEvent {
+        entity,
+        overrides: Vec::new(),
+    };
+    crate::events::dispatch_drop_rules(&mut event);
+    decide_death_drop(
+        &event.drop_rules(),
+        item,
+        item_rule,
+        slot_rule,
         drop_prevented,
     )
 }
@@ -132,10 +160,8 @@ mod tests {
 
     #[test]
     fn tag_predicate_accepts_own_and_universal_tag() {
-        let slot = crate::registry::slot_types()
-            .iter()
-            .find(|slot| slot.id() == "ring")
-            .unwrap();
+        let types = crate::registry::slot_types();
+        let slot = types.iter().find(|slot| slot.id() == "ring").unwrap();
         let ctx = context("ring");
         assert!(is_stack_valid(slot, &ctx, "curios:ring"));
         assert!(is_stack_valid(slot, &ctx, "curios:curio"));

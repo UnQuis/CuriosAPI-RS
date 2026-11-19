@@ -478,13 +478,15 @@ fn decode_inventory(value: &Compound) -> Result<CurioInventory, AttachmentError>
 pub static INVENTORY: AttachmentType<CurioInventory> = AttachmentType {
     namespace: "curios",
     name: "inventory",
-    default: || CurioInventory::from_slot_types(registry::slot_types()),
+    default: || CurioInventory::from_slot_types(registry::slot_types().as_slice()),
     codec: Some(AttachmentCodec {
         encode: encode_inventory,
         decode: decode_inventory,
     }),
     copy_on_death: true,
-    sync: false,
+    // The client needs the stacks for GUI and entity rendering; the codec is
+    // strict, so the engine can mirror the whole inventory to watching clients.
+    sync: true,
 };
 
 #[cfg(test)]

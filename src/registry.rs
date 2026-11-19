@@ -1,11 +1,13 @@
-//! Built-in slot definitions and the process-wide slot-type registry.
+//! Built-in slot definitions and the replaceable process-wide slot registry.
 //!
 //! The eleven definitions are shipped with the mod (ported byte-for-byte from
 //! the LGPL-3.0-or-later Curios reference, copyright 2018-2024 C4) and are
 //! decoded strictly through [`SlotType::from_definition`]. A definition with no
-//! explicit `size` uses the server setting `default_slot_count`.
+//! explicit `size` uses the server setting `default_slot_count`. The registry
+//! is an `Arc` snapshot so a data-pack reload can replace it without holding a
+//! lock across gameplay hooks.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, RwLock};
 
 use crate::config;
 use crate::slots::{SlotDefinition, SlotError, SlotType};
@@ -28,7 +30,14 @@ pub const BUILTIN: [(&str, &str); 11] = [
     ("charm", include_str!("../data/curios/curios/slots/charm.json")),
 ];
 
-static SLOT_TYPES: OnceLock<Vec<SlotType>> = OnceLock::new();
+static SLOT_TYPES: RwLock<Option<Arc<Vec<SlotType>>>> = RwLock::new(None);
+
+fn read_registry() -> Option<Arc<Vec<SlotType>>> {
+    SLOT_TYPES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
 
 /// Decodes the built-in definitions. Every parse error is returned, never
 /// masked by a default: a malformed shipped definition is a packaging bug.
@@ -46,14 +55,19 @@ pub fn builtin_slot_types() -> Result<Vec<SlotType>, SlotError> {
         .collect()
 }
 
-/// The installed registry. Initialised from the bundled definitions on first
-/// use; data-pack reloads replace the cached value.
-pub fn slot_types() -> &'static [SlotType] {
-    SLOT_TYPES.get_or_init(|| {
-        builtin_slot_types().unwrap_or_else(|error| {
-            panic!("invalid built-in Curios slot definition: {error}");
-        })
-    })
+/// The installed registry snapshot, initialised from the bundled definitions
+/// on first use and replaceable by a validated data-pack reload.
+pub fn slot_types() -> Arc<Vec<SlotType>> {
+    if let Some(types) = read_registry() {
+        return types;
+    }
+    let types = Arc::new(builtin_slot_types().unwrap_or_else(|error| {
+        panic!("invalid built-in Curios slot definition: {error}");
+    }));
+    let mut guard = SLOT_TYPES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.get_or_insert(types).clone()
 }
 
 /// Replaces the cached registry after a validated reload.
@@ -61,9 +75,11 @@ pub fn replace_slot_types(types: Vec<SlotType>) -> Result<(), SlotError> {
     if types.is_empty() {
         return Err(SlotError::EmptyRegistry);
     }
-    SLOT_TYPES
-        .set(types)
-        .map_err(|_| SlotError::RegistryAlreadyInitialised)
+    let mut guard = SLOT_TYPES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(Arc::new(types));
+    Ok(())
 }
 
 /// Index of a slot type in the deterministic registry order.
@@ -75,8 +91,8 @@ pub fn slot_type_index(id: &str) -> Option<u16> {
 }
 
 /// The slot type at an index from [`slot_type_index`].
-pub fn slot_type_at(index: u16) -> Option<&'static SlotType> {
-    slot_types().get(usize::from(index))
+pub fn slot_type_at(index: u16) -> Option<SlotType> {
+    slot_types().get(usize::from(index)).cloned()
 }
 
 #[cfg(test)]
@@ -98,7 +114,7 @@ mod tests {
         let types = slot_types();
         for (index, slot) in types.iter().enumerate() {
             assert_eq!(slot_type_index(slot.id()), Some(index as u16));
-            assert_eq!(slot_type_at(index as u16), Some(slot));
+            assert_eq!(slot_type_at(index as u16).as_ref(), Some(slot));
         }
         assert_eq!(slot_type_index("missing"), None);
     }
