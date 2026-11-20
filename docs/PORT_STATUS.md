@@ -80,7 +80,10 @@ out of the shipped native build.
 
 ## Verification
 
-- `cargo test --offline`: **160 passed, 0 failed** (134 lib + 26 regression).
+- `cargo test --offline`: **161 passed, 0 failed** (135 lib + 26 regression).
 - `git diff --check`: clean.
-- `horizon-launcher native-build --version nightly-2026-11-18-dd67b76 .`:
-  **success** — `native-dd67b76-e9e0c1f32e42` built and installed.
+- SDK pin updated to `5ef7734fdd854add5efd6817178be3c988d8d050`
+  (nightly 2026-11-19) with the matching `Cargo.lock`; no source changes were
+  required. `horizon-launcher native-build --instance curios-test .` —
+  **success**, `native-5ef7734-09c066880309` built and installed into the
+  dedicated `Curios-Test` instance.
