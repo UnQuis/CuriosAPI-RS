@@ -121,12 +121,35 @@ fn read_inventory(
     host: &dyn ClientHost,
     entity: EntityRef,
 ) -> Result<Option<CurioInventory>, String> {
+    // Player attachments are keyed by UUID on both sides. A client cannot map
+    // an entity id to a uuid, so walk the snapshot rows and match the player
+    // handle whose entity id this frame names; fall back to the entity row for
+    // non-player living entities and to the local player as a last resort.
     let query = host
         .query(&INVENTORY)
         .map_err(|error| format!("attachment query refused: {error:?}"))?;
-    query
-        .get(AttachmentHolder::Entity(entity))
-        .map_err(|error| format!("inventory row could not be decoded: {error:?}"))
+    let mut entity_row = None;
+    for row in query.iter() {
+        let row = row.map_err(|error| format!("inventory row could not be decoded: {error:?}"))?;
+        match row.holder {
+            AttachmentHolder::Player(player) if player.entity().id() == entity.id() => {
+                return Ok(Some(row.value.clone()));
+            }
+            AttachmentHolder::Entity(found) if found == entity => {
+                entity_row = Some(row.value.clone());
+            }
+            _ => {}
+        }
+    }
+    if entity_row.is_some() {
+        return Ok(entity_row);
+    }
+    match host.local_player() {
+        Some(player) => query
+            .get(AttachmentHolder::Player(player))
+            .map_err(|error| format!("inventory row could not be decoded: {error:?}")),
+        None => Ok(None),
+    }
 }
 
 /// For `Hooks::render_living_pre`: resolve the synced stacks for this entity

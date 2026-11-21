@@ -12,7 +12,8 @@
 //! `villager_trade`, `dialog`, `data_maps`); a mod-declared registry is not one
 //! of those kinds. Entries are read from real pack files at the exact path
 //! returned by [`entry_file`], i.e. `data/curios/curios/slot_type/<id>.json`.
-//! [`data_pack_files`] therefore only marks a pending rebuild.
+//! [`data_pack_files`] only contributes the tag files (a supported kind) and
+//! marks a pending rebuild.
 //!
 //! Adapted from `CuriosSlotResources#populateData` and
 //! `CuriosCommonEvents` of TheIllusiveC4/Curios (LGPL-3.0-or-later,
@@ -25,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use mod_api::{
     AttachmentQueriesMut, DataPackFilesEvent, DatapackField, DatapackFieldKind, DatapackReadError,
-    DatapackRegistrationError, DatapackRegistrySync, DatapackValue, Holder, Host, Registrar,
+    DatapackRegistrationError, DatapackRegistrySync, DatapackValue, Host, Registrar,
     ServerHost, ServerTickEvent,
 };
 
@@ -42,6 +43,16 @@ pub const REGISTRY_PATH: &str = "slot_type";
 pub const REGISTRY_KEY: &str = "curios:slot_type";
 /// Dimension queried for the server-wide datapack registry set.
 pub const DEFAULT_DIMENSION: &str = "overworld";
+
+/// Tag files the engine needs to resolve `#curios:curio` and player-like
+/// entities. `data_pack_files` keys use `tags/<namespace>:<registry>/<name>`.
+const TAG_FILES: [(&str, &str); 2] = [
+    ("tags/curios:item/curio", r#"{"values":[]}"#),
+    (
+        "tags/curios:entity_type/player_like",
+        r#"{"values":["minecraft:player"]}"#,
+    ),
+];
 
 static RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -238,13 +249,18 @@ pub fn flat_entry(id: &str, definition: &SlotDefinition) -> String {
     serde_json::Value::Object(object).to_string()
 }
 
-/// Marks the next server tick for a rebuild when data packs are reloaded.
+/// Contributes the two tag files and marks the next server tick for a rebuild.
 ///
-/// No files are contributed: the SDK's `data_pack_files` keys are only for the
-/// kinds its tables read, and a mod-declared datapack registry is not among
-/// them. Entries must be real pack files at [`entry_file`] paths.
-pub fn data_pack_files(_event: &mut DataPackFilesEvent<'_>) {
+/// Registry entries cannot be contributed through `data_pack_files`: only the
+/// table kinds it lists are accepted (tags are one of them). Slot entries must
+/// be real pack files at [`entry_file`] paths.
+pub fn data_pack_files(event: &mut DataPackFilesEvent<'_>) {
     mark_pending();
+    for (path, json) in TAG_FILES {
+        event
+            .files
+            .push((path.to_owned(), json.as_bytes().to_vec()));
+    }
 }
 
 fn required<'a>(
@@ -398,7 +414,7 @@ fn apply(types: Vec<SlotType>, host: &mut dyn ServerHost) {
     migrate_resident_inventories(host, &types);
     for player in host.players().server_players() {
         let uuid = player.uuid();
-        let holder = Holder::Entity(player.entity().id());
+        let holder = inventory::holder_for_player(uuid);
         let Ok(inventory) = inventory::INVENTORY.get(host, holder) else {
             eprintln!("[curios] could not read inventory during slot reload");
             continue;
@@ -550,13 +566,23 @@ mod tests {
     }
 
     #[test]
-    fn data_pack_files_adds_no_registry_entries() {
+    fn data_pack_files_ships_tags_but_no_registry_entries() {
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
         let mut event = DataPackFilesEvent { files: &mut files };
         data_pack_files(&mut event);
-        // The SDK exposes no overlay key that the registry decoder reads;
-        // contributing `curios/slot_type/curios:<id>` would be silently ignored.
-        assert!(files.is_empty());
+        // Tags are a supported `data_pack_files` kind and fix the client's
+        // "#curios:curio does not exist" warning.
+        let paths: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "tags/curios:item/curio",
+                "tags/curios:entity_type/player_like"
+            ]
+        );
+        assert!(files
+            .iter()
+            .all(|(path, _)| !path.contains("slot_type") && !path.contains("slots/")));
         assert!(take_pending());
     }
 

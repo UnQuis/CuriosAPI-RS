@@ -15,13 +15,14 @@ use mod_api::testing::FakeHost;
 use mod_api::{
     Compound, DatapackValue, HostTransaction, Identifier, IPayloadContext, ItemResource, ItemStack,
     PayloadAccepted, PayloadBytes, PayloadContextError, PayloadDirection, PayloadId, PayloadProtocol,
-    PayloadSendError, PayloadWork, PayloadWorkStatus, PlaceProvider, PlayerRef, Tag, Text,
+    Holder, PayloadSendError, PayloadWork, PayloadWorkStatus, PlaceProvider, PlayerRef,
+    RegisterCommandsEvent, Tag, Text,
 };
 use mod_curios::inventory::{CurioInventory, INVENTORY};
 use mod_curios::slots::SlotContext;
 use mod_curios::{
-    attributes, config, datapack, drop, effects, equip, events, input, inventory, lang, menu, net,
-    place, registry, slots,
+    attributes, commands, config, datapack, drop, effects, equip, events, input, inventory, lang,
+    menu, net, place, registry, slots,
 };
 
 fn ring_slot() -> slots::SlotType {
@@ -552,6 +553,78 @@ fn regression_a_gui_can_equip_host_via_tag_predicate() {
             validator.resource_id().as_str().as_str() == "curios:none"
         }
     ));
+}
+
+// 7C(a) — players use the UUID holder; mobs keep the entity-id holder.
+#[test]
+fn regression_7c_holder_selection() {
+    const UUID: u128 = 42;
+    const PLAYER_ENTITY: u32 = 17;
+    const MOB_ENTITY: u32 = 99;
+    assert_eq!(inventory::holder_for_player(UUID), Holder::Player(UUID));
+    let mut host = FakeHost::new();
+    let level = host.level.level();
+    host.players.join(UUID, PLAYER_ENTITY, level);
+    assert_eq!(
+        inventory::holder_for_server_entity(&mut host, PLAYER_ENTITY),
+        Holder::Player(UUID),
+        "an online player must use Holder::Player(uuid)"
+    );
+    assert_eq!(
+        inventory::holder_for_server_entity(&mut host, MOB_ENTITY),
+        Holder::Entity(MOB_ENTITY),
+        "a mob must keep Holder::Entity(id)"
+    );
+}
+
+// 7C(a) — every registered command survives the engine's kind validation.
+#[test]
+fn regression_7c_command_argument_kinds() {
+    const VALID: &[&str] = &[
+        "word", "text", "integer", "number", "boolean", "player", "item", "entity", "entities",
+        "players", "block_pos", "mod_id", "custom",
+    ];
+    let mut registered = Vec::new();
+    commands::register(&mut RegisterCommandsEvent {
+        commands: &mut registered,
+    });
+    assert!(!registered.is_empty(), "no commands were registered");
+    for command in registered {
+        assert!(
+            !command.usage.contains(":string"),
+            "command still uses the invalid `string` kind: {}",
+            command.usage
+        );
+        for token in command.usage.split_whitespace() {
+            let value = token
+                .trim_start_matches(|c| c == '<' || c == '[')
+                .trim_end_matches(|c| c == '>' || c == ']');
+            if let Some((_, kind)) = value.split_once(':') {
+                assert!(
+                    VALID.contains(&kind) || kind.starts_with("resource:"),
+                    "unknown argument kind `{kind}` in `{}`",
+                    command.usage
+                );
+            }
+        }
+    }
+}
+
+// 7C(c) — the physical item tag file must exist and be a valid tag definition.
+#[test]
+fn regression_7c_curio_tag_file() {
+    let path = format!(
+        "{}/data/curios/tags/item/curio.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("missing tag file {path}: {error}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|error| panic!("invalid tag file: {error}"));
+    assert!(
+        parsed.get("values").is_some_and(serde_json::Value::is_array),
+        "the curios:curio tag has no values array"
+    );
 }
 
 // B — the real menu→inventory mapping and source/destination place keys.

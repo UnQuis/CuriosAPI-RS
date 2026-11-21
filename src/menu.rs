@@ -462,6 +462,27 @@ pub fn apply_screen_state(
     });
 }
 
+/// Overlay paths of the two shipped tag files, in the form the
+/// `data_pack_files` hook expects (`<kind>/<namespace>:<path>`, no `.json`).
+pub const CURIO_ITEM_TAG_PATH: &str = "tags/curios:item/curio";
+pub const PLAYER_LIKE_TAG_PATH: &str = "tags/curios:entity_type/player_like";
+
+/// Byte contents of the shipped tag files. Push these into `DataPackFilesEvent`
+/// so the engine actually registers `#curios:curio` and `#curios:player_like`;
+/// a file on disk alone is not contributed to a native mod's data load.
+pub fn tag_files() -> Vec<(String, Vec<u8>)> {
+    vec![
+        (
+            CURIO_ITEM_TAG_PATH.to_owned(),
+            include_bytes!("../data/curios/tags/item/curio.json").to_vec(),
+        ),
+        (
+            PLAYER_LIKE_TAG_PATH.to_owned(),
+            include_bytes!("../data/curios/tags/entity_type/player_like.json").to_vec(),
+        ),
+    ]
+}
+
 /// Sends the current curio view to one player. The vanilla menu remains the
 /// container backing, but every visible stack is read from the mod places.
 pub fn sync_state(host: &mut dyn ServerHost, uuid: u128) -> bool {
@@ -471,7 +492,9 @@ pub fn sync_state(host: &mut dyn ServerHost, uuid: u128) -> bool {
     let page = player_state(uuid).page;
     let cosmetic = player_state(uuid).cosmetic;
     let entity = player.entity().id();
-    let holder = Holder::Entity(entity);
+    // Online players are keyed by UUID in the attachment store; the entity id
+    // holder produced MissingHolder in the live client.
+    let holder = crate::inventory::holder_for_player(uuid);
     let inventory = crate::inventory::INVENTORY.get(host, holder).ok();
     let mut wire = Vec::new();
     for (position, cell) in display_cells(page, cosmetic).into_iter().enumerate() {
@@ -538,10 +561,10 @@ pub fn toggle_render(host: &mut dyn ServerHost, uuid: u128, slot: usize) -> bool
     if cell.cosmetic {
         return false;
     }
-    let Some(player) = host.player(uuid) else {
+    if host.player(uuid).is_none() {
         return false;
-    };
-    let holder = Holder::Entity(player.entity().id());
+    }
+    let holder = crate::inventory::holder_for_player(uuid);
     let Ok(mut inventory) = crate::inventory::INVENTORY.get(host, holder) else {
         return false;
     };
@@ -590,10 +613,10 @@ pub fn toggle_cosmetics(host: &mut dyn ServerHost, uuid: u128) -> bool {
 /// slot of the player. Clearing is a mutation of the authoritative attachment,
 /// never of the mirrored menu.
 pub fn destroy(host: &mut dyn ServerHost, uuid: u128) -> bool {
-    let Some(player) = host.player(uuid) else {
+    if host.player(uuid).is_none() {
         return false;
-    };
-    let holder = Holder::Entity(player.entity().id());
+    }
+    let holder = crate::inventory::holder_for_player(uuid);
     let Ok(mut inventory) = crate::inventory::INVENTORY.get(host, holder) else {
         return false;
     };
@@ -1314,6 +1337,40 @@ mod tests {
         let at = [rect[0] + 2.0, rect[1] + 2.0];
         assert_eq!(layout.hit_with_buttons(at, true), Control::PageNext);
         assert_ne!(layout.hit_with_buttons(at, false), Control::PageNext);
+    }
+
+    #[test]
+    fn inventory_holder_uses_the_uuid_not_the_entity_id() {
+        let uuid = 0x0123_4567_89ab_cdef_u128;
+        let holder = crate::inventory::holder_for_player(uuid);
+        assert_eq!(holder, Holder::Player(uuid));
+        assert_ne!(holder, Holder::Entity(7));
+    }
+
+    #[test]
+    fn tag_files_are_contributed_under_engine_overlay_paths() {
+        let files = tag_files();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, CURIO_ITEM_TAG_PATH);
+        assert_eq!(files[1].0, PLAYER_LIKE_TAG_PATH);
+        for (path, bytes) in files {
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or_else(|error| panic!("{path}: {error}"));
+            assert!(value["values"].is_array(), "{path} has no values array");
+        }
+    }
+
+    #[test]
+    fn shipped_tag_files_exist_and_parse() {
+        let item: serde_json::Value =
+            serde_json::from_str(include_str!("../data/curios/tags/item/curio.json"))
+                .expect("curios:curio tag must be valid JSON");
+        assert_eq!(item["values"], serde_json::json!([]));
+        let entities: serde_json::Value = serde_json::from_str(include_str!(
+            "../data/curios/tags/entity_type/player_like.json"
+        ))
+        .expect("curios:player_like tag must be valid JSON");
+        assert_eq!(entities["values"][0], serde_json::json!("minecraft:player"));
     }
 
     #[test]

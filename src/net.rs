@@ -944,9 +944,9 @@ fn read_inventory(
     host: &mut dyn ServerHost,
     uuid: u128,
 ) -> Result<crate::inventory::CurioInventory, NetError> {
-    let entity_id = player(host, uuid)?.entity().id();
+    player(host, uuid)?;
     crate::inventory::INVENTORY
-        .get(host, mod_api::Holder::Entity(entity_id))
+        .get(host, crate::inventory::holder_for_player(uuid))
         .map_err(NetError::from)
 }
 
@@ -956,9 +956,9 @@ fn write_inventory(
     uuid: u128,
     inventory: crate::inventory::CurioInventory,
 ) -> Result<(), NetError> {
-    let entity_id = player(host, uuid)?.entity().id();
+    player(host, uuid)?;
     crate::inventory::INVENTORY
-        .set(host, mod_api::Holder::Entity(entity_id), inventory)
+        .set(host, crate::inventory::holder_for_player(uuid), inventory)
         .map_err(NetError::from)
 }
 

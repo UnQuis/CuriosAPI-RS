@@ -21,7 +21,7 @@ use mod_api::{
 
 use crate::attributes::{ModifierOperation, SlotSizeModifier};
 use crate::events::{self, SlotModifiersUpdatedEvent};
-use crate::inventory::INVENTORY;
+use crate::inventory::{self, INVENTORY};
 use crate::net;
 use crate::place;
 use crate::registry;
@@ -31,35 +31,81 @@ use crate::slots::SlotType;
 /// bound keeps a malformed command from allocating an unbounded inventory.
 pub const MAX_SLOTS: usize = 64;
 
+/// Every command specification, with whether it needs permission level 2.
+/// Registration and the validation test both read this table.
+pub const COMMAND_SPECS: [(&str, bool); 10] = [
+    ("curios list [player:player]", false),
+    ("curios set <slot:word> <player:player> [amount:integer]", true),
+    ("curios add <slot:word> <player:player> [amount:integer]", true),
+    ("curios remove <slot:word> <player:player> [amount:integer]", true),
+    ("curios clear [player:player] [slot:word]", true),
+    (
+        "curios replace <slot:word> <index:integer> <player:player> with <item:item> [count:integer]",
+        true,
+    ),
+    ("curios slots", false),
+    ("curios reload", true),
+    ("curios open", false),
+    ("curios help", false),
+];
+
 /// Declares every command. Mutating subcommands require permission level 2,
 /// matching the Java command's gamemaster requirement.
 pub fn register(event: &mut RegisterCommandsEvent<'_>) {
-    event.commands.push(Command::new("curios list [player:player]"));
-    event.commands.push(Command::op(
-        "curios set <slot:string> <player:player> [amount:integer]",
-        2,
-    ));
-    event.commands.push(Command::op(
-        "curios add <slot:string> <player:player> [amount:integer]",
-        2,
-    ));
-    event.commands.push(Command::op(
-        "curios remove <slot:string> <player:player> [amount:integer]",
-        2,
-    ));
-    event.commands.push(Command::op(
-        "curios clear [player:player] [slot:string]",
-        2,
-    ));
-    event.commands.push(Command::op(
-        "curios replace <slot:string> <index:integer> <player:player> with <item:item> [count:integer]",
-        2,
-    ));
-    // Port-specific additions.
-    event.commands.push(Command::new("curios slots"));
-    event.commands.push(Command::op("curios reload", 2));
-    event.commands.push(Command::new("curios open"));
-    event.commands.push(Command::new("curios help"));
+    for (spec, needs_op) in COMMAND_SPECS {
+        if let Err(error) = validate_command_spec(spec) {
+            eprintln!("[curios] refusing invalid command spec `{spec}`: {error}");
+            continue;
+        }
+        if needs_op {
+            event.commands.push(Command::op(spec, 2));
+        } else {
+            event.commands.push(Command::new(spec));
+        }
+    }
+}
+
+/// Validates one argument kind against Horizon 0.2's closed kind list.
+fn valid_argument_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "word"
+            | "text"
+            | "integer"
+            | "number"
+            | "boolean"
+            | "player"
+            | "item"
+            | "entity"
+            | "entities"
+            | "players"
+            | "block_pos"
+            | "mod_id"
+            | "custom"
+    ) || kind.starts_with("resource:")
+}
+
+/// Checks the `<name:kind>` / `[name:kind]` tokens of a registration string.
+fn validate_command_spec(spec: &str) -> Result<(), String> {
+    for token in spec.split_whitespace() {
+        let inner = if let Some(inner) = token.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+            inner
+        } else if let Some(inner) = token.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            inner
+        } else {
+            continue;
+        };
+        let (name, kind) = inner
+            .split_once(':')
+            .ok_or_else(|| format!("argument {inner} in `{spec}` has no kind"))?;
+        if name.is_empty() || kind.is_empty() {
+            return Err(format!("empty argument name or kind in `{spec}`"));
+        }
+        if !valid_argument_kind(kind) {
+            return Err(format!("unknown argument kind `{kind}` in `{spec}`"));
+        }
+    }
+    Ok(())
 }
 
 /// Returns whether this invocation belongs to `/curios`.
@@ -227,7 +273,7 @@ fn list(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Result<(),
         return Ok(());
     }
     let player = target_player(host, event.command, name)?;
-    let holder = Holder::Entity(player.entity().id());
+    let holder = inventory::holder_for_player(player.uuid());
     let inventory = INVENTORY.get(host, holder).map_err(|error| format!("{error:?}"))?;
     feedback(host, Text::literal("§6Curios slots§r"));
     for id in inventory.slot_ids() {
@@ -259,7 +305,7 @@ fn resize(
     let player = target_player(host, event.command, words.get(3).map(String::as_str))?;
     let amount = amount_value(int_arg(event.command, 2, 1)?)?;
     let uuid = player.uuid();
-    let holder = Holder::Entity(player.entity().id());
+    let holder = inventory::holder_for_player(player.uuid());
     let inventory = INVENTORY.get(host, holder).map_err(|error| format!("{error:?}"))?;
     let base = inventory
         .slot(&slot)
@@ -316,9 +362,14 @@ fn resize_slot(
     if target > MAX_SLOTS {
         return Err(format!("slot count must be <= {MAX_SLOTS}"));
     }
-    let entity_id = match holder {
-        Holder::Entity(id) => *id,
-        _ => return Err("curio slots are only held by entities".to_owned()),
+    let entity_id = match *holder {
+        Holder::Entity(id) => id,
+        Holder::Player(owner) => host
+            .player(owner)
+            .ok_or_else(|| format!("player {owner} is not online"))?
+            .entity()
+            .id(),
+        _ => return Err("curio slots are only held by entities or players".to_owned()),
     };
     let mut inventory = INVENTORY.get(host, *holder).map_err(|error| format!("{error:?}"))?;
     let old = inventory
@@ -370,7 +421,7 @@ fn clear(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Result<()
     let player = target_player(host, event.command, words.get(2).map(String::as_str))?;
     let filter = words.get(3).map(String::as_str);
     let uuid = player.uuid();
-    let holder = Holder::Entity(player.entity().id());
+    let holder = inventory::holder_for_player(player.uuid());
     let mut inventory = INVENTORY.get(host, holder).map_err(|error| format!("{error:?}"))?;
     let ids: Vec<String> = match filter {
         Some(slot) => {
@@ -441,7 +492,7 @@ fn replace(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Result<
         return Err(format!("the slot refused the exchange ({moved}/{count} moved)"));
     }
 
-    let holder = Holder::Entity(entity);
+    let holder = inventory::holder_for_player(uuid);
     let inventory = INVENTORY.get(host, holder).map_err(|error| format!("{error:?}"))?;
     let item = inventory
         .slot(&slot)
@@ -522,8 +573,7 @@ pub fn reload(host: &mut dyn ServerHost) -> Result<(), String> {
     let players: Vec<_> = host.players().server_players().into_iter().collect();
     for player in players {
         let uuid = player.uuid();
-        let entity = player.entity();
-        let holder = Holder::Entity(entity.id());
+        let holder = inventory::holder_for_player(uuid);
         let mut inventory = INVENTORY.get(host, holder).map_err(|error| format!("{error:?}"))?;
         // `reload` adopts stacks that no longer fit into `inventory.invalid`;
         // the ordinary server tick drops them from there instead of losing them.
@@ -567,6 +617,26 @@ pub fn open(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Result
 mod tests {
     use super::*;
     use crate::attributes::SlotSizeState;
+
+    #[test]
+    fn every_registered_command_uses_a_valid_argument_kind() {
+        assert_eq!(COMMAND_SPECS.len(), 10);
+        for (spec, _) in COMMAND_SPECS {
+            validate_command_spec(spec)
+                .unwrap_or_else(|error| panic!("invalid command spec `{spec}`: {error}"));
+            assert!(!spec.contains("slot:string"), " Horizon rejects `string` kinds: {spec}");
+        }
+        assert!(validate_command_spec("curios set <slot:wat> <player:player>").is_err());
+        assert!(validate_command_spec("curios set <slot>").is_err());
+        assert!(validate_command_spec("curios value <id:resource:curios:slot_type>").is_ok());
+    }
+
+    #[test]
+    fn player_commands_select_the_player_holder() {
+        let uuid = 42u128;
+        assert_eq!(inventory::holder_for_player(uuid), Holder::Player(uuid));
+        assert_ne!(inventory::holder_for_player(uuid), Holder::Entity(42));
+    }
 
     #[test]
     fn help_lists_every_java_subcommand() {

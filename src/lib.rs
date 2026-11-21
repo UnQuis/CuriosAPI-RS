@@ -137,7 +137,7 @@ impl Hooks for Curios {
         effects::refresh_effects(host);
         for player in host.players().server_players() {
             let entity = player.entity();
-            let holder = Holder::Entity(entity.id());
+            let holder = inventory::holder_for_player(player.uuid());
             let mut inventory = match inventory::INVENTORY.get(host, holder) {
                 Ok(inventory) => inventory,
                 Err(error) => {
@@ -182,6 +182,8 @@ impl Hooks for Curios {
     }
 
     fn data_pack_files(&self, _host: &mut dyn ServerHost, event: &mut DataPackFilesEvent<'_>) {
+        // Contributes both the slot-type entries and the two tags (physical
+        // files under data/ alone are not seen by the engine).
         datapack::data_pack_files(event);
     }
 
@@ -202,7 +204,7 @@ impl Hooks for Curios {
     }
 
     fn living_death(&self, host: &mut dyn ServerHost, event: &mut LivingDeathEvent<'_>) -> Flow {
-        let holder = Holder::Entity(event.entity);
+        let holder = inventory::holder_for_server_entity(host, event.entity);
         let Ok(mut inventory) = inventory::INVENTORY.get(host, holder) else {
             return Flow::Continue;
         };

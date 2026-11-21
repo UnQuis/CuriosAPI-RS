@@ -153,7 +153,7 @@ pub fn aggregate_for_entity(host: &dyn Host, entity: EntityRef) -> CurioEffects 
             return CurioEffects::default();
         }
     };
-    let inventory = match query.get(AttachmentHolder::Entity(entity)) {
+    let inventory = match query.get(attachment_holder(host, entity)) {
         Ok(Some(inventory)) => inventory,
         Ok(None) => return CurioEffects::default(),
         Err(error) => {
@@ -183,12 +183,29 @@ fn aggregate_from_inventory(inventory: &inventory::CurioInventory) -> CurioEffec
 
 static TICK_EFFECTS: Mutex<BTreeMap<u32, CurioEffects>> = Mutex::new(BTreeMap::new());
 
+/// Entity-id → player-uuid map captured by [`refresh_effects`].
+static TICK_PLAYERS: Mutex<BTreeMap<u32, u128>> = Mutex::new(BTreeMap::new());
+
+/// Resolves the attachment holder for an entity, using `AttachmentHolder::Player`
+/// for players (their data is not keyed by entity id) and `Entity` for mobs.
+pub fn attachment_holder(host: &dyn Host, entity: EntityRef) -> AttachmentHolder {
+    let uuid = TICK_PLAYERS
+        .lock()
+        .ok()
+        .and_then(|players| players.get(&entity.id()).copied());
+    match uuid.and_then(|uuid| host.player(uuid)) {
+        Some(player) => AttachmentHolder::Player(player),
+        None => AttachmentHolder::Entity(entity),
+    }
+}
+
 /// Refreshes the per-entity effect cache from `server_tick`.
 ///
 /// Some hooks (`living_breathe`) receive only an entity id and no host, so a
 /// tick-fresh snapshot is necessary there.
 pub fn refresh_effects(host: &mut dyn ServerHost) {
     let mut values = BTreeMap::new();
+    let mut players = BTreeMap::new();
     // Mobs receive `living_breathe` too, so the cache must cover every loaded
     // entity, not just online players (review #19).
     for level in host.levels().list_levels() {
@@ -196,9 +213,14 @@ pub fn refresh_effects(host: &mut dyn ServerHost) {
             continue;
         };
         for entity in entities {
+            if let Some(uuid) = crate::inventory::player_uuid_for_entity(host, entity.id()) {
+                players.insert(entity.id(), uuid);
+            }
             values.insert(entity.id(), aggregate_for_entity(host, entity));
         }
     }
+    let mut player_cache = TICK_PLAYERS.lock().unwrap_or_else(|e| e.into_inner());
+    *player_cache = players;
     let mut cache = TICK_EFFECTS.lock().unwrap_or_else(|e| e.into_inner());
     *cache = values;
 }

@@ -6,12 +6,12 @@
 //! a slot type index and a slot index. The stack itself lives in the entity's
 //! [`INVENTORY`] attachment.
 
-use mod_api::{Holder, ItemPlace, ItemResource, PlaceProvider, ServerHost};
+use mod_api::{ItemPlace, ItemResource, PlaceProvider, ServerHost};
 
 use crate::curio::{self, CurioContext};
 use crate::equip::{self, TriState};
 use crate::events::{self, ChangeKind, CurioChangeEvent, SlotModifiersUpdatedEvent};
-use crate::inventory::{CurioInventory, INVENTORY, InventoryError, ItemSnapshot};
+use crate::inventory::{self, CurioInventory, INVENTORY, InventoryError, ItemSnapshot};
 use crate::net::{self, NetTag};
 use crate::registry;
 use crate::slots::{SlotContext, SlotType};
@@ -87,15 +87,6 @@ fn context_for(key: u64) -> Option<(u32, SlotType, SlotContext)> {
     Some((entity, slot_type, context))
 }
 
-/// Player uuid for a targeted stack sync; non-player entities get no packet.
-fn player_uuid(host: &mut dyn ServerHost, entity: u32) -> Option<u128> {
-    host.players()
-        .server_players()
-        .into_iter()
-        .find(|player| player.entity().id() == entity)
-        .map(|player| player.uuid())
-}
-
 /// Dispatches change/modifier events, item behavior hooks and the targeted
 /// `sync_stack` packet after a successful server-side write.
 fn notify_change(
@@ -146,7 +137,7 @@ fn notify_change(
         });
     }
 
-    let Some(uuid) = player_uuid(host, entity) else {
+    let Some(uuid) = inventory::player_uuid_for_entity(host, entity) else {
         return;
     };
     let handler_type = if cosmetic {
@@ -195,7 +186,8 @@ fn count_changed(before: Option<usize>, after: Option<usize>) -> bool {
 fn slot_count(host: &mut dyn ServerHost, key: u64) -> Option<usize> {
     let (entity, type_index, _) = parse_key(key);
     let slot_type = registry::slot_type_at(type_index)?;
-    let inventory = INVENTORY.get(host, Holder::Entity(entity)).ok()?;
+    let holder = inventory::holder_for_server_entity(host, entity);
+    let inventory = INVENTORY.get(host, holder).ok()?;
     inventory.slot(slot_type.id()).map(|handler| handler.len())
 }
 
@@ -204,7 +196,8 @@ fn read_stack(host: &mut dyn ServerHost, key: u64) -> Result<Option<mod_api::Ite
     let (entity, type_index, raw_slot) = parse_key(key);
     let slot = raw_slot & SLOT_MASK;
     let slot_type = registry::slot_type_at(type_index).ok_or(InventoryError::ItemDecode)?;
-    let inventory = INVENTORY.get(host, Holder::Entity(entity))?;
+    let holder = inventory::holder_for_server_entity(host, entity);
+    let inventory = INVENTORY.get(host, holder)?;
     let entry = inventory.slot(slot_type.id()).and_then(|handler| {
         if is_cosmetic(key) {
             handler.cosmetic(usize::from(slot))
@@ -227,7 +220,8 @@ fn write_stack(
     let (entity, type_index, raw_slot) = parse_key(key);
     let slot = raw_slot & SLOT_MASK;
     let slot_type = registry::slot_type_at(type_index).ok_or(InventoryError::ItemEncode)?;
-    let mut inventory: CurioInventory = INVENTORY.get(host, Holder::Entity(entity))?;
+    let holder = inventory::holder_for_server_entity(host, entity);
+    let mut inventory: CurioInventory = INVENTORY.get(host, holder)?;
     let snapshot = match stack {
         Some(stack) => Some(ItemSnapshot::from_stack(host, stack)?),
         None => None,
@@ -240,7 +234,8 @@ fn write_stack(
     } else {
         handler.set_stack(usize::from(slot), snapshot)?;
     }
-    INVENTORY.set(host, Holder::Entity(entity), inventory)?;
+    let holder = inventory::holder_for_server_entity(host, entity);
+    INVENTORY.set(host, holder, inventory)?;
     Ok(())
 }
 

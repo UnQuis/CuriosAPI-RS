@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use mod_api::{
-    AttachmentCodec, AttachmentError, AttachmentType, Compound, Holder, Host, ItemStack, ServerHost,
-    Tag,
+    AttachmentCodec, AttachmentError, AttachmentHolder, AttachmentType, Compound, EntityRef,
+    Holder, Host, ItemStack, PlayerRef, ServerHost, Tag,
 };
 
 use crate::attributes::{
@@ -406,6 +406,57 @@ impl CurioInventory {
     }
 }
 
+/// Holder of an online player's inventory attachment.
+///
+/// Horizon keys player data by `Holder::Player(uuid)`; using
+/// `Holder::Entity(entity id)` yields `AttachmentError::MissingHolder`.
+pub const fn holder_for_player(uuid: u128) -> Holder {
+    Holder::Player(uuid)
+}
+
+/// Holder of a non-player entity's inventory attachment.
+pub const fn holder_for_entity(entity_id: u32) -> Holder {
+    Holder::Entity(entity_id)
+}
+
+/// Resolves a server entity id to the holder used by the inventory store.
+pub fn holder_for_server_entity(host: &mut dyn ServerHost, entity_id: u32) -> Holder {
+    host.players()
+        .server_players()
+        .into_iter()
+        .find(|player| player.entity().id() == entity_id)
+        .map(|player| holder_for_player(player.uuid()))
+        .unwrap_or_else(|| holder_for_entity(entity_id))
+}
+
+/// Resolves a server entity handle to the residency identity used by
+/// attachment queries (players use `AttachmentHolder::Player`).
+pub fn attachment_holder_for_server_entity(
+    host: &mut dyn ServerHost,
+    entity: EntityRef,
+) -> AttachmentHolder {
+    host.players()
+        .server_players()
+        .into_iter()
+        .find(|player| player.entity() == entity)
+        .map(AttachmentHolder::Player)
+        .unwrap_or(AttachmentHolder::Entity(entity))
+}
+
+/// Residency identity of an already-resolved player.
+pub const fn attachment_holder_for_player(player: PlayerRef) -> AttachmentHolder {
+    AttachmentHolder::Player(player)
+}
+
+/// Uuid of an online player whose entity id is `entity_id`.
+pub fn player_uuid_for_entity(host: &mut dyn ServerHost, entity_id: u32) -> Option<u128> {
+    host.players()
+        .server_players()
+        .into_iter()
+        .find(|player| player.entity().id() == entity_id)
+        .map(|player| player.uuid())
+}
+
 /// Migrates a saved but currently unloaded player's inventory on login.
 ///
 /// Horizon cannot enumerate offline attachment rows, so the join hook must
@@ -449,7 +500,10 @@ fn strings(list: &[Option<ItemSnapshot>]) -> Vec<Tag> {
     list.iter()
         .map(|item| match item {
             Some(item) => Tag::Compound(item.0.clone()),
-            None => Tag::End,
+            // NBT lists cannot contain End: the engine refuses to save the
+            // player when an empty slot writes one. An empty compound is the
+            // on-disk representation of an empty slot.
+            None => Tag::Compound(Compound::new()),
         })
         .collect()
 }
@@ -460,7 +514,10 @@ fn read_items(value: Option<&Tag>) -> Result<Vec<Option<ItemSnapshot>>, Attachme
     };
     list.iter()
         .map(|tag| match tag {
+            // Legacy saved data may contain End; current data uses an empty
+            // compound because the engine refuses End inside a list.
             Tag::End => Ok(None),
+            Tag::Compound(compound) if compound.is_empty() => Ok(None),
             Tag::Compound(compound) => Ok(Some(ItemSnapshot(compound.clone()))),
             _ => Err(AttachmentError::Decode),
         })
@@ -689,6 +746,13 @@ mod tests {
     }
 
     #[test]
+    fn holder_helpers_select_player_storage() {
+        assert_eq!(holder_for_player(42), Holder::Player(42));
+        assert_eq!(holder_for_entity(7), Holder::Entity(7));
+        assert_ne!(holder_for_player(7), holder_for_entity(7));
+    }
+
+    #[test]
     fn codec_round_trip() {
         let mut inventory = CurioInventory::from_slot_types(&[slot()]);
         let handler = inventory.slot_mut("ring").unwrap();
@@ -700,6 +764,26 @@ mod tests {
         let encoded = encode_inventory(&inventory).unwrap();
         let decoded = decode_inventory(&encoded).unwrap();
         assert_eq!(inventory, decoded);
+    }
+
+    #[test]
+    fn empty_slots_are_encoded_without_nbt_end_tags() {
+        let inventory = CurioInventory::from_slot_types(&[slot()]);
+        let encoded = encode_inventory(&inventory).unwrap();
+        let slots = encoded.get(&"slots".into()).unwrap();
+        fn contains_end(tag: &Tag) -> bool {
+            match tag {
+                Tag::End => true,
+                Tag::List(values) => values.iter().any(contains_end),
+                Tag::Compound(values) => values.values().any(contains_end),
+                _ => false,
+            }
+        }
+        assert!(
+            !contains_end(slots),
+            "NBT lists cannot contain End; the engine refuses to save the player"
+        );
+        assert_eq!(decode_inventory(&encoded).unwrap(), inventory);
     }
 
     #[test]

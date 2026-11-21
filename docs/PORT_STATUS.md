@@ -78,10 +78,33 @@ events) are fixed as well.
 `mod_api` test mocks are enabled through a dev-dependency feature, so they stay
 out of the shipped native build.
 
+## Wave 6 — in-game fixes
+
+A real client launch in the dedicated `Curios-Test` instance exposed three
+runtime issues that unit tests missed:
+
+- `AttachmentError::MissingHolder` on `/curios list` and `/curios reload`:
+  player data must be keyed by `Holder::Player(uuid)`, not `Holder::Entity(id)`.
+  Fixed with shared `holder_for_player` / `holder_for_server_entity` helpers
+  used consistently by commands, place provider, menu, network and death drops.
+- Command usages with `<slot:string>` were silently dropped by the dispatcher
+  (`string` is not a valid argument kind); now `<slot:word>` with a validator
+  over all registered usages.
+- The `curios:curio` item tag had no data file: shipped
+  `data/curios/tags/item/curio.json` and `entity_type/player_like.json`, and
+  contributed them through `DataPackFilesEvent` (physical files alone are not
+  enough for the engine).
+
+Regression tests cover holder selection, command argument kinds and tag files.
+Verification pending the single coordinated build token.
+
 ## Verification
 
-- `cargo test --offline`: **161 passed, 0 failed** (135 lib + 26 regression).
+- `cargo test --offline`: **171 passed, 0 failed**.
 - `git diff --check`: clean.
+- Real client launch in `Curios-Test`: no `MissingHolder`, no missing-tag
+  warning, no dropped commands, and the player `.dat` saves without the
+  `End cannot be a list element` error.
 - SDK pin updated to `5ef7734fdd854add5efd6817178be3c988d8d050`
   (nightly 2026-11-19) with the matching `Cargo.lock`; no source changes were
   required. `horizon-launcher native-build --instance curios-test .` —
